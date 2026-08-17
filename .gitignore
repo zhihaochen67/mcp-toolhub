@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Runtime state
+.toolhub/
+.pytest_cache/
+.test-tmp/
