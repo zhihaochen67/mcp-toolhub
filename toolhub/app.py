@@ -1,6 +1,8 @@
 from mcp.server import MCPServer
 
+from toolhub.tools.audit import register_audit_tools
 from toolhub.tools.filesystem import register_filesystem_tools
+from toolhub.tools.git import register_git_tools
 from toolhub.tools.shell import register_shell_tools
 
 
@@ -26,3 +28,5 @@ def ping(message: str = "hello") -> dict[str, str]:
 
 register_filesystem_tools(mcp)
 register_shell_tools(mcp)
+register_git_tools(mcp)
+register_audit_tools(mcp)

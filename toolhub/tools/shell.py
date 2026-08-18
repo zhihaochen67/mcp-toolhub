@@ -1,10 +1,12 @@
 import subprocess
+import time
 from pathlib import Path
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
+from toolhub.observability import audit
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalStatus
 from toolhub.security.paths import (
@@ -71,6 +73,10 @@ def _to_text(value: str | bytes | None) -> str:
     return value
 
 
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
 def _execute_subprocess(
     program: str,
     args: list[str],
@@ -79,12 +85,21 @@ def _execute_subprocess(
     risk: RiskLevel,
     risk_reason: str,
     *,
+    tool: str,
+    trace_id: str,
+    action: str,
     request_id: str | None = None,
     approval_status: ApprovalStatus | None = None,
     message: str = "",
 ) -> ShellRunResult:
-    """Execute a structured command with shell=False and return its result."""
+    """Execute a structured command with shell=False and return its result.
+
+    Every outcome (success, non-zero exit, timeout, start failure) is
+    recorded in the audit log.
+    """
     relative_cwd = relative_workspace_path(working_directory)
+    arguments = {"program": program, "args": args}
+    started = time.monotonic()
 
     try:
         completed = subprocess.run(
@@ -101,6 +116,25 @@ def _execute_subprocess(
         )
 
     except subprocess.TimeoutExpired as exc:
+        duration_ms = _elapsed_ms(started)
+        audit.record_event(
+            trace_id=trace_id,
+            tool=tool,
+            action="timeout",
+            risk=risk,
+            approval_status=approval_status,
+            request_id=request_id,
+            executed=True,
+            success=False,
+            duration_ms=duration_ms,
+            arguments=arguments,
+            cwd=relative_cwd,
+            error=f"Command timed out after {timeout_seconds}s",
+            error_type=type(exc).__name__,
+            stdout_chars=len(_to_text(exc.stdout)),
+            stderr_chars=len(_to_text(exc.stderr)),
+        )
+
         return ShellRunResult(
             program=program,
             args=args,
@@ -116,8 +150,48 @@ def _execute_subprocess(
             message=message,
         )
 
-    except FileNotFoundError as exc:
-        raise ValueError(f"Executable not found: {program}") from exc
+    except OSError as exc:
+        duration_ms = _elapsed_ms(started)
+        audit.record_event(
+            trace_id=trace_id,
+            tool=tool,
+            action="failure",
+            risk=risk,
+            approval_status=approval_status,
+            request_id=request_id,
+            executed=False,
+            success=False,
+            duration_ms=duration_ms,
+            arguments=arguments,
+            cwd=relative_cwd,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+
+        if isinstance(exc, FileNotFoundError):
+            raise ValueError(f"Executable not found: {program}") from exc
+
+        raise ValueError(f"Failed to start {program}: {exc}") from exc
+
+    duration_ms = _elapsed_ms(started)
+    success = completed.returncode == 0
+
+    audit.record_event(
+        trace_id=trace_id,
+        tool=tool,
+        action=action,
+        risk=risk,
+        approval_status=approval_status,
+        request_id=request_id,
+        executed=True,
+        success=success,
+        duration_ms=duration_ms,
+        returncode=completed.returncode,
+        arguments=arguments,
+        cwd=relative_cwd,
+        stdout_chars=len(completed.stdout),
+        stderr_chars=len(completed.stderr),
+    )
 
     return ShellRunResult(
         program=program,
@@ -159,13 +233,32 @@ def run_shell(
     PENDING approval request and do not execute.
     """
 
+    trace_id = audit.new_trace_id()
+    started = time.monotonic()
     command_args = list(args or [])
 
     assessment = assess_shell_command(program, command_args)
 
-    working_directory = _resolve_working_directory(cwd)
+    try:
+        working_directory = _resolve_working_directory(cwd)
+    except (FileNotFoundError, ValueError) as exc:
+        audit.record_event(
+            trace_id=trace_id,
+            tool="shell.run",
+            action="failure",
+            risk=assessment.level,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"program": program, "args": command_args},
+            cwd=cwd,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        raise
 
     timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
+    relative_cwd = relative_workspace_path(working_directory)
 
     if assessment.level == RiskLevel.LOW:
         return _execute_subprocess(
@@ -175,21 +268,38 @@ def run_shell(
             timeout_seconds,
             assessment.level,
             assessment.reason,
+            tool="shell.run",
+            trace_id=trace_id,
+            action="execute",
         )
 
     request = approval.create_request(
         program=program,
         args=command_args,
-        cwd=relative_workspace_path(working_directory),
+        cwd=relative_cwd,
         timeout_seconds=timeout_seconds,
         risk=assessment.level,
         risk_reason=assessment.reason,
     )
 
+    audit.record_event(
+        trace_id=trace_id,
+        tool="shell.run",
+        action="approval_request",
+        risk=assessment.level,
+        approval_status=request.status,
+        request_id=request.request_id,
+        executed=False,
+        success=True,
+        duration_ms=_elapsed_ms(started),
+        arguments={"program": program, "args": command_args},
+        cwd=relative_cwd,
+    )
+
     return ShellRunResult(
         program=program,
         args=command_args,
-        cwd=relative_workspace_path(working_directory),
+        cwd=relative_cwd,
         risk=assessment.level,
         risk_reason=assessment.reason,
         executed=False,
@@ -233,12 +343,38 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
     This is the only execution path for MEDIUM/HIGH commands. It accepts no
     replacement program/args/cwd: it always replays the snapshot captured at
     request time, and the approval is consumed atomically so it cannot be
-    replayed.
+    replayed. Every refusal (unknown/PENDING/REJECTED/EXPIRED/CONSUMED) and
+    execution outcome is audited.
     """
+
+    trace_id = audit.new_trace_id()
+    started = time.monotonic()
+
+    def audit_rejection(*, status, error, error_type="ApprovalStateError", program="", args=None, cwd=".", risk=None):
+        audit.record_event(
+            trace_id=trace_id,
+            tool="shell.run_approved",
+            action="approval_rejected",
+            risk=risk,
+            approval_status=status,
+            request_id=request_id,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"program": program, "args": list(args or [])},
+            cwd=cwd,
+            error=error,
+            error_type=error_type,
+        )
 
     request = approval.get_request(request_id)
 
     if request is None:
+        audit_rejection(
+            status=None,
+            error=f"Unknown approval request: {request_id}",
+            error_type="KeyError",
+        )
         return _rejected_result(
             request_id,
             status=None,
@@ -247,6 +383,14 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
 
     if request.status != ApprovalStatus.APPROVED:
+        audit_rejection(
+            status=request.status,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            error=f"Request is {request.status.value}; cannot execute.",
+        )
         return _rejected_result(
             request_id,
             program=request.program,
@@ -264,6 +408,14 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
     if consumed is None:
         current = approval.get_request(request_id)
         status = current.status if current is not None else ApprovalStatus.EXPIRED
+        audit_rejection(
+            status=status,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            error=f"Approval could not be consumed (status {status.value}).",
+        )
         return _rejected_result(
             request_id,
             program=request.program,
@@ -278,7 +430,16 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
     # Re-validate the stored cwd against the workspace (defense in depth).
     try:
         working_directory = resolve_workspace_path(consumed.cwd)
-    except ValueError:
+    except ValueError as exc:
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error="Stored cwd escapes the workspace; refused.",
+            error_type=type(exc).__name__,
+        )
         return _rejected_result(
             request_id,
             program=consumed.program,
@@ -291,6 +452,15 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
 
     if not working_directory.is_dir():
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error="Stored cwd is not a directory; refused.",
+            error_type="NotADirectoryError",
+        )
         return _rejected_result(
             request_id,
             program=consumed.program,
@@ -311,6 +481,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         timeout_seconds,
         consumed.risk,
         consumed.risk_reason,
+        tool="shell.run_approved",
+        trace_id=trace_id,
+        action="execute_approved",
         request_id=request_id,
         approval_status=consumed.status,
     )
