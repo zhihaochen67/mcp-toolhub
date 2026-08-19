@@ -28,10 +28,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from toolhub.security.paths import PROJECT_ROOT
+from toolhub.security.paths import STATE_ROOT
 
 
-DEFAULT_AUDIT_PATH = PROJECT_ROOT / ".toolhub" / "audit.jsonl"
+DEFAULT_AUDIT_PATH = STATE_ROOT / "audit.jsonl"
 
 MAX_STRING_CHARS = 200
 MAX_COLLECTION_ITEMS = 20

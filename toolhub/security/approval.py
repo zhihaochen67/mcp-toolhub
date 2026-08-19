@@ -34,7 +34,7 @@ from typing import Iterator
 
 from pydantic import BaseModel, Field
 
-from toolhub.security.paths import PROJECT_ROOT
+from toolhub.security.paths import STATE_ROOT
 from toolhub.security.risk import RiskLevel
 
 
@@ -79,7 +79,7 @@ class ApprovalRequest(BaseModel):
 # --------------------------------------------------------------------------
 
 DEFAULT_TTL_SECONDS = 300  # 5 minutes
-DEFAULT_STORE_PATH = PROJECT_ROOT / ".toolhub" / "approvals.json"
+DEFAULT_STORE_PATH = STATE_ROOT / "approvals.json"
 STORE_VERSION = 1
 
 LOCK_TIMEOUT_SECONDS = 5.0

@@ -47,7 +47,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from toolhub.observability import audit
-from toolhub.security.paths import WORKSPACE_ROOT
+from toolhub.security.paths import get_workspace_root
 
 
 GIT_TIMEOUT_SECONDS = 20
@@ -288,7 +288,7 @@ def git_status(root: Path | None = None) -> GitStatusResult:
     """
     trace_id = audit.new_trace_id()
     started = time.monotonic()
-    repo_root = root or WORKSPACE_ROOT
+    repo_root = root or get_workspace_root()
     arguments = {"subcommand": "status"}
 
     try:
@@ -362,7 +362,7 @@ def git_diff(
     """
     trace_id = audit.new_trace_id()
     started = time.monotonic()
-    repo_root = root or WORKSPACE_ROOT
+    repo_root = root or get_workspace_root()
     arguments = {"path": path, "staged": staged}
 
     # --no-ext-diff / --no-textconv prevent external diff helpers and

@@ -49,6 +49,8 @@ def _new_temp_dir(prefix: str) -> Path:
 
 @pytest.fixture(autouse=True)
 def isolated_approval_store(monkeypatch):
+    from toolhub.security.paths import _reset_workspace_configuration_for_tests
+
     store_dir = _new_temp_dir("approvals")
     store = store_dir / "approvals.json"
     audit_log = store_dir / "audit.jsonl"
@@ -56,9 +58,12 @@ def isolated_approval_store(monkeypatch):
     monkeypatch.setenv("TOOLHUB_APPROVAL_STORE", str(store))
     monkeypatch.setenv("TOOLHUB_APPROVAL_TTL_SECONDS", "300")
     monkeypatch.setenv("TOOLHUB_AUDIT_PATH", str(audit_log))
+    monkeypatch.delenv("TOOLHUB_WORKSPACE_ROOT", raising=False)
+    _reset_workspace_configuration_for_tests()
 
     yield store
 
+    _reset_workspace_configuration_for_tests()
     _rmtree(store_dir)
 
 

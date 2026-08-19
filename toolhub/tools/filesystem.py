@@ -45,7 +45,7 @@ from toolhub.security import approval
 from toolhub.security.approval import ApprovalRequest, ApprovalStatus
 from toolhub.security.paths import (
     MAX_FILE_SIZE,
-    WORKSPACE_ROOT,
+    get_workspace_root,
     resolve_path_within,
 )
 from toolhub.security.risk import RiskLevel
@@ -139,7 +139,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _effective_root(root: Path | None) -> Path:
-    return (root or WORKSPACE_ROOT).resolve()
+    return (root or get_workspace_root()).resolve()
 
 
 def _relative_to_root(root: Path, path: Path) -> str:
@@ -503,6 +503,32 @@ def _validate_payload(request: ApprovalRequest, kind: str, required: set[str]) -
     return payload
 
 
+def _validate_workspace_snapshot(payload: dict, root: Path) -> None:
+    """Refuse a new-style approval captured for another workspace.
+
+    Older stored approvals did not carry this field, so absence remains
+    backward-compatible. Every request created by this version includes the
+    canonical root and is therefore bound across server restarts as well as
+    within one process.
+    """
+
+    snapshot = payload.get("workspace_root")
+    if snapshot is None:
+        return
+
+    try:
+        approved_root = Path(str(snapshot)).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            "Approval workspace no longer exists or cannot be resolved"
+        ) from exc
+
+    if approved_root != root.resolve():
+        raise ValueError(
+            "Approval was created for a different ToolHub workspace"
+        )
+
+
 # --------------------------------------------------------------------------
 # Read tool
 # --------------------------------------------------------------------------
@@ -618,6 +644,7 @@ def write_file(
             "content": content,
             "expected_hash": expected_hash,
             "create_parents": create_parents,
+            "workspace_root": str(root),
             "trace_id": trace_id,
         },
         risk=RiskLevel.MEDIUM,
@@ -697,6 +724,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
         payload = _validate_payload(
             request, "file_write", {"path", "content", "expected_hash", "create_parents"}
         )
+        _validate_workspace_snapshot(payload, root)
         path = str(payload["path"])
         content = str(payload["content"])
         expected_hash = payload.get("expected_hash")
@@ -843,6 +871,7 @@ def apply_patch(
             "path": path,
             "patch": patch,
             "expected_hash": expected_hash,
+            "workspace_root": str(root),
             "trace_id": trace_id,
         },
         risk=RiskLevel.MEDIUM,
@@ -922,6 +951,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         payload = _validate_payload(
             request, "file_patch", {"path", "patch", "expected_hash"}
         )
+        _validate_workspace_snapshot(payload, root)
         path = str(payload["path"])
         patch = str(payload["patch"])
         expected_hash = payload.get("expected_hash")
@@ -1036,7 +1066,8 @@ def register_filesystem_tools(mcp: MCPServer) -> None:
     def list_directory(path: str = ".") -> ListDirectoryResult:
         """List files and directories inside the ToolHub workspace."""
 
-        target = resolve_path_within(path)
+        root = get_workspace_root()
+        target = resolve_path_within(path, root)
 
         if not target.exists():
             raise FileNotFoundError(f"Directory not found: {path}")
@@ -1069,7 +1100,7 @@ def register_filesystem_tools(mcp: MCPServer) -> None:
             )
 
         return ListDirectoryResult(
-            path=_relative_to_root(WORKSPACE_ROOT, target),
+            path=_relative_to_root(root, target),
             entries=entries,
         )
 

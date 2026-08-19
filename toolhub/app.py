@@ -1,5 +1,12 @@
 from mcp.server import MCPServer
 
+from toolhub.security.paths import initialize_workspace_configuration
+
+
+# Validate and freeze process-level configuration before any MCP tools are
+# imported or registered. Direct library use remains lazy for testability.
+initialize_workspace_configuration()
+
 from toolhub.tools.audit import register_audit_tools
 from toolhub.tools.filesystem import register_filesystem_tools
 from toolhub.tools.git import register_git_tools

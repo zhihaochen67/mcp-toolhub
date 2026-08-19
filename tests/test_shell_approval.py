@@ -9,7 +9,7 @@ import pytest
 
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalStatus
-from toolhub.security.paths import WORKSPACE_ROOT, resolve_workspace_path
+from toolhub.security.paths import get_workspace_root, resolve_workspace_path
 from toolhub.security.risk import RiskLevel
 from toolhub.tools.shell import run_approved_shell, run_shell
 
@@ -146,7 +146,7 @@ def test_request_id_cannot_alter_command(monkeypatch):
     cmd, kwargs = calls[0]
     assert cmd == ["python", "--version"]
     assert kwargs["shell"] is False
-    assert kwargs["cwd"] == WORKSPACE_ROOT
+    assert kwargs["cwd"] == get_workspace_root()
 
 
 def test_workspace_path_security_still_works():

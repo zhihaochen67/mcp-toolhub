@@ -10,6 +10,7 @@ from toolhub.observability import audit
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalStatus
 from toolhub.security.paths import (
+    get_workspace_root,
     relative_workspace_path,
     resolve_workspace_path,
 )
@@ -280,6 +281,7 @@ def run_shell(
         timeout_seconds=timeout_seconds,
         risk=assessment.level,
         risk_reason=assessment.reason,
+        payload={"workspace_root": str(get_workspace_root())},
     )
 
     audit.record_event(
@@ -401,6 +403,38 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             status=request.status,
             message=f"Request is {request.status.value}; cannot execute.",
         )
+
+    approved_workspace = request.payload.get("workspace_root")
+    if approved_workspace is not None:
+        try:
+            workspace_matches = (
+                Path(str(approved_workspace)).resolve(strict=True)
+                == get_workspace_root()
+            )
+        except (OSError, RuntimeError):
+            workspace_matches = False
+
+        if not workspace_matches:
+            message = "Approval was created for a different ToolHub workspace."
+            audit_rejection(
+                status=request.status,
+                program=request.program,
+                args=request.args,
+                cwd=request.cwd,
+                risk=request.risk,
+                error=message,
+                error_type="WorkspaceBoundaryViolation",
+            )
+            return _rejected_result(
+                request_id,
+                program=request.program,
+                args=request.args,
+                cwd=request.cwd,
+                risk=request.risk,
+                risk_reason=request.risk_reason,
+                status=request.status,
+                message=message,
+            )
 
     # Atomically APPROVED -> CONSUMED. Single-use: a second call fails here.
     consumed = approval.consume_request(request_id)
