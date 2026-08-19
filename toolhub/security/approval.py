@@ -32,7 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from toolhub.security.paths import PROJECT_ROOT
 from toolhub.security.risk import RiskLevel
@@ -47,13 +47,23 @@ class ApprovalStatus(str, Enum):
 
 
 class ApprovalRequest(BaseModel):
-    """An immutable-on-approval description of a command awaiting approval."""
+    """An immutable-on-approval description of an action awaiting approval.
+
+    ``kind="shell"`` requests carry ``program``/``args``/``cwd``; mutation
+    requests (``file_write`` / ``file_patch``) carry their exact snapshot in
+    ``payload``. Only bounded metadata of mutations should ever be shown or
+    logged outside the secure store.
+    """
 
     request_id: str
-    program: str
-    args: list[str]
-    cwd: str
-    timeout_seconds: int
+
+    kind: str = "shell"
+    payload: dict = Field(default_factory=dict)
+
+    program: str = ""
+    args: list[str] = Field(default_factory=list)
+    cwd: str = "."
+    timeout_seconds: int = 20
 
     risk: RiskLevel
     risk_reason: str
@@ -279,23 +289,31 @@ def _apply_decision(
 
 def create_request(
     *,
-    program: str,
+    program: str = "",
     args: list[str] | None = None,
     cwd: str = ".",
     timeout_seconds: int = 20,
     risk: RiskLevel,
     risk_reason: str,
+    kind: str = "shell",
+    payload: dict | None = None,
     ttl_seconds: int | None = None,
     store_path: Path | None = None,
     now: datetime | None = None,
 ) -> ApprovalRequest:
-    """Create and persist a PENDING approval request."""
+    """Create and persist a PENDING approval request.
+
+    ``kind``/``payload`` carry non-shell mutations (file writes, patches);
+    the payload is the exact snapshot that approved execution will replay.
+    """
     path = store_path or _default_store_path()
     ttl = _default_ttl_seconds() if ttl_seconds is None else ttl_seconds
     current = now or _now()
 
     request = ApprovalRequest(
         request_id=_new_request_id(),
+        kind=kind,
+        payload=dict(payload or {}),
         program=program,
         args=list(args or []),
         cwd=cwd,

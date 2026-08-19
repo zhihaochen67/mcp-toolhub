@@ -13,26 +13,67 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalRequest
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _describe_mutation(request: ApprovalRequest) -> str:
+    """Bounded metadata for a mutation approval — never the content/patch."""
+    payload = request.payload or {}
+    path = str(payload.get("path", "?"))
+
+    lines = [f"  mutation:     {request.kind} path={path}"]
+
+    if request.kind == "file_write":
+        content = payload.get("content")
+        if isinstance(content, str):
+            lines.append(
+                f"  content:      {len(content)} chars, sha256={_sha256_text(content)}"
+            )
+        lines.append(f"  expected:     sha256={payload.get('expected_hash')}")
+        lines.append(f"  parents:      {bool(payload.get('create_parents'))}")
+
+    elif request.kind == "file_patch":
+        patch = payload.get("patch")
+        if isinstance(patch, str):
+            lines.append(
+                f"  patch:        {len(patch)} chars, sha256={_sha256_text(patch)}"
+            )
+        lines.append(f"  expected:     sha256={payload.get('expected_hash')}")
+
+    return "\n".join(lines)
+
+
 def _format_request(request: ApprovalRequest) -> str:
-    args = " ".join(request.args) if request.args else ""
     decided = request.decided_at.isoformat() if request.decided_at else "-"
-    return (
-        f"{request.request_id}\n"
-        f"  status:       {request.status.value}\n"
-        f"  command:      {request.program} {args}".rstrip()
-        + f"\n"
-        f"  cwd:          {request.cwd}\n"
-        f"  risk:         {request.risk.value} ({request.risk_reason})\n"
-        f"  created_at:   {request.created_at.isoformat()}\n"
-        f"  expires_at:   {request.expires_at.isoformat()}\n"
-        f"  decided_at:   {decided}"
-    )
+
+    lines = [
+        request.request_id,
+        f"  status:       {request.status.value}",
+    ]
+
+    if request.kind == "shell":
+        args = " ".join(request.args) if request.args else ""
+        lines.append(f"  kind:         shell")
+        lines.append(f"  command:      {request.program} {args}".rstrip())
+        lines.append(f"  cwd:          {request.cwd}")
+    else:
+        lines.append(f"  kind:         {request.kind}")
+        lines.append(_describe_mutation(request))
+
+    lines.append(f"  risk:         {request.risk.value} ({request.risk_reason})")
+    lines.append(f"  created_at:   {request.created_at.isoformat()}")
+    lines.append(f"  expires_at:   {request.expires_at.isoformat()}")
+    lines.append(f"  decided_at:   {decided}")
+
+    return "\n".join(lines)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
