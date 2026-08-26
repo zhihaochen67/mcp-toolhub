@@ -10,6 +10,8 @@ import pytest
 
 from toolhub.observability import audit
 from toolhub.security import approval
+from toolhub.security.executable_snapshot import resolve_executable_snapshot
+from toolhub.security.paths import get_workspace_root, resolve_workspace_path
 from toolhub.security.risk import RiskLevel
 from toolhub.tools.shell import run_approved_shell, run_shell
 
@@ -29,6 +31,14 @@ def _create_request(**kwargs):
         "risk_reason": "test",
     }
     defaults.update(kwargs)
+    payload = dict(defaults.pop("payload", {}))
+    snapshot = resolve_executable_snapshot(
+        defaults["program"],
+        working_directory=resolve_workspace_path(defaults["cwd"]),
+    )
+    payload.setdefault("workspace_root", str(get_workspace_root()))
+    payload.setdefault("executable_snapshot", snapshot.to_payload())
+    defaults["payload"] = payload
     return approval.create_request(**defaults)
 
 
@@ -49,6 +59,13 @@ def test_low_execution_creates_audit_record():
     assert event["stdout_chars"] > 0
     assert event["arguments"]["program"] == "python"
     assert event["arguments"]["args"] == ["--version"]
+    policy = event["extra"]["command_policy"]
+    assert policy["decision"] == "auto_execute"
+    assert policy["profile"] == "python.version.long"
+    assert policy["argument_shape"] == "python --version"
+    assert policy["execution_kind"] == "intrinsic"
+    assert policy["executable"]["trusted"] is True
+    assert Path(policy["executable"]["resolved_path"]).is_absolute()
 
 
 def test_medium_approval_creates_audit_record():
@@ -63,6 +80,38 @@ def test_medium_approval_creates_audit_record():
     assert event["request_id"] == result.request_id
     assert event["executed"] is False
     assert event["success"] is True
+    assert event["extra"]["command_policy"]["decision"] == "approval_required"
+
+
+def test_generic_git_approval_audit_explains_policy():
+    result = run_shell("git", ["status"])
+    assert result.executed is False
+
+    event = _last_event()
+    policy = event["extra"]["command_policy"]
+    assert policy["decision"] == "approval_required"
+    assert policy["risk"] == "HIGH"
+    assert policy["profile"] is None
+    assert policy["executable"]["trusted"] is False
+    assert "Generic Git" in policy["reason"]
+
+
+def test_approved_execution_keeps_policy_audit_correlation(monkeypatch):
+    created = run_shell("git", ["status"])
+    approval.approve_request(created.request_id)
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout="clean\n", stderr="")
+
+    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    result = run_approved_shell(created.request_id)
+
+    assert result.executed is True
+    event = _last_event()
+    assert event["action"] == "execute_approved"
+    assert event["request_id"] == created.request_id
+    assert event["extra"]["command_policy"]["decision"] == "approval_required"
+    assert event["extra"]["command_policy"]["risk"] == "HIGH"
 
 
 def test_high_approval_creates_audit_record():
@@ -141,7 +190,9 @@ def test_timeout_audited(monkeypatch):
 
     monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
 
-    result = run_shell("python", ["--version"])
+    request = _create_request(program="pytest", args=["-q"])
+    approval.approve_request(request.request_id)
+    result = run_approved_shell(request.request_id)
     assert result.executed is True
     assert result.timed_out is True
 
@@ -158,8 +209,11 @@ def test_execution_failure_audited(monkeypatch):
 
     monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
 
+    request = _create_request(program="pytest", args=["-q"])
+    approval.approve_request(request.request_id)
+
     with pytest.raises(ValueError, match="Executable not found"):
-        run_shell("python", ["--version"])
+        run_approved_shell(request.request_id)
 
     event = _last_event()
     assert event["action"] == "failure"

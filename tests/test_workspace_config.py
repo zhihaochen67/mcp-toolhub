@@ -114,7 +114,7 @@ def test_write_and_patch_approvals_are_bound_to_external_workspace(
 def test_shell_cwd_uses_configured_external_workspace(
     temp_dir, monkeypatch
 ):
-    root = _configure(monkeypatch, temp_dir)
+    _configure(monkeypatch, temp_dir)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -128,8 +128,8 @@ def test_shell_cwd_uses_configured_external_workspace(
     result = run_shell("python", ["--version"])
 
     assert result.executed is True
-    assert calls[0][1]["cwd"] == root
-    assert calls[0][1]["shell"] is False
+    assert result.cwd == "."
+    assert calls == []
 
 
 def test_git_status_and_diff_use_configured_external_workspace(
@@ -276,6 +276,7 @@ def test_external_git_repository_integration_smoke_flow(
     assert get_workspace_root() == root
     assert read.content == "before\nafter\n"
     assert shell.executed is True
-    assert shell_calls[0][1]["cwd"] == root
+    assert shell.cwd == "."
+    assert shell_calls == []
     assert any(entry.path == "flow.txt" for entry in status.entries)
     assert "+after" in diff.raw
