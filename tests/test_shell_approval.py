@@ -6,6 +6,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
@@ -51,6 +53,33 @@ def _make_executable(directory: Path, stem: str, content: str) -> Path:
     path.write_text(content, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path.resolve()
+
+
+_DEFAULT_WORKSPACE = object()
+
+
+def _create_shell_request_with_workspace(
+    workspace_snapshot=_DEFAULT_WORKSPACE,
+    *,
+    cwd: str = ".",
+):
+    snapshot = resolve_executable_snapshot(
+        sys.executable,
+        working_directory=get_workspace_root(),
+    )
+    payload = {"executable_snapshot": snapshot.to_payload()}
+    if workspace_snapshot is _DEFAULT_WORKSPACE:
+        payload["workspace_root"] = str(get_workspace_root())
+    elif workspace_snapshot is not None:
+        payload["workspace_root"] = workspace_snapshot
+    return approval.create_request(
+        program=sys.executable,
+        args=["--version"],
+        cwd=cwd,
+        risk=RiskLevel.MEDIUM,
+        risk_reason="test",
+        payload=payload,
+    )
 
 
 def test_low_python_version_executes():
@@ -299,6 +328,137 @@ def test_approved_request_without_executable_snapshot_fails_closed():
     assert result.executed is False
     assert result.approval_status == ApprovalStatus.CONSUMED
     assert "no executable snapshot" in result.message
+
+
+@pytest.mark.parametrize(
+    "workspace_snapshot",
+    [None, 123, "", "."],
+    ids=["missing", "wrong-type", "empty", "relative"],
+)
+def test_invalid_workspace_snapshot_fails_after_consumption(workspace_snapshot):
+    request = _create_shell_request_with_workspace(workspace_snapshot)
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.approval_status == ApprovalStatus.CONSUMED
+    assert "workspace" in result.message.lower()
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
+
+
+def test_mismatched_workspace_snapshot_is_consumed(temp_dir):
+    request = _create_shell_request_with_workspace(str(temp_dir.resolve()))
+    approval.approve_request(request.request_id)
+
+    first = run_approved_shell(request.request_id)
+    second = run_approved_shell(request.request_id)
+
+    assert first.executed is False
+    assert first.approval_status == ApprovalStatus.CONSUMED
+    assert "different ToolHub workspace" in first.message
+    assert second.executed is False
+    assert second.approval_status == ApprovalStatus.CONSUMED
+
+
+def test_nonexistent_workspace_snapshot_fails_strict_resolution():
+    missing_root = get_workspace_root() / "missing-approved-workspace"
+    request = _create_shell_request_with_workspace(str(missing_root))
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.approval_status == ApprovalStatus.CONSUMED
+    assert "cannot be resolved" in result.message
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    ["\0", "../outside", "missing-directory"],
+    ids=["malformed", "outside", "missing"],
+)
+def test_invalid_stored_cwd_fails_after_consumption(cwd):
+    request = _create_shell_request_with_workspace(cwd=cwd)
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.approval_status == ApprovalStatus.CONSUMED
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
+
+
+def test_wrong_approval_kind_is_not_consumed_by_shell():
+    request = approval.create_request(
+        kind="file_write",
+        risk=RiskLevel.MEDIUM,
+        risk_reason="test",
+        payload={"workspace_root": str(get_workspace_root())},
+    )
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.approval_status == ApprovalStatus.APPROVED
+    assert approval.get_request(request.request_id).status == ApprovalStatus.APPROVED
+
+
+def test_concurrent_replay_allows_at_most_one_execution(monkeypatch):
+    request = _create_request()
+    approval.approve_request(request.request_id)
+    barrier = threading.Barrier(2)
+    original_consume = approval.consume_request
+    executions = []
+    execution_lock = threading.Lock()
+
+    def synchronized_consume(request_id):
+        barrier.wait(timeout=5)
+        return original_consume(request_id)
+
+    def fake_run(command, **kwargs):
+        with execution_lock:
+            executions.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(approval, "consume_request", synchronized_consume)
+    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _: run_approved_shell(request.request_id), range(2))
+        )
+
+    assert sum(result.executed for result in results) == 1
+    assert len(executions) == 1
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
+
+
+def test_executable_validation_is_the_final_identity_step(monkeypatch):
+    request = _create_request()
+    approval.approve_request(request.request_id)
+    order = []
+
+    from toolhub.tools import shell as shell_module
+
+    original_validate = shell_module.validate_executable_snapshot
+
+    def track_validation(payload):
+        order.append("validate")
+        return original_validate(payload)
+
+    def fake_run(command, **kwargs):
+        order.append("launch")
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(shell_module, "validate_executable_snapshot", track_validation)
+    monkeypatch.setattr(shell_module.subprocess, "run", fake_run)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is True
+    assert order == ["validate", "launch"]
 
 
 def test_unresolved_executable_creates_no_approval():

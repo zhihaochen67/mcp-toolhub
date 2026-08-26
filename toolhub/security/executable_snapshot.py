@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ntpath
 import os
 import stat
 from collections.abc import Mapping
@@ -29,6 +30,30 @@ class ExecutableSnapshot:
             "sha256": self.sha256,
             "size": self.size,
         }
+
+    def audit_metadata(
+        self,
+        *,
+        requested_program: str,
+        workspace_root: Path,
+    ) -> dict[str, object]:
+        """Return bounded identity metadata without an external directory."""
+        metadata: dict[str, object] = {
+            "requested_name": ntpath.basename(requested_program),
+            "resolved_name": self.path.name,
+            "scope": "external",
+            "sha256": self.sha256,
+            "size": self.size,
+            "identity_scope": "primary_executable_only",
+        }
+        try:
+            workspace_path = self.path.relative_to(workspace_root)
+        except ValueError:
+            pass
+        else:
+            metadata["scope"] = "workspace"
+            metadata["workspace_path"] = workspace_path.as_posix()
+        return metadata
 
 
 def _path_key(path: Path) -> tuple[int, int, int, int]:
@@ -174,8 +199,8 @@ def resolve_executable_snapshot(
     )
 
 
-def validate_executable_snapshot(payload: object) -> Path:
-    """Re-hash a stored snapshot and return its unchanged canonical path."""
+def parse_executable_snapshot(payload: object) -> ExecutableSnapshot:
+    """Parse the bounded executable identity stored in an approval."""
     if not isinstance(payload, dict):
         raise TypeError("Approval request has no executable snapshot.")
 
@@ -186,6 +211,7 @@ def validate_executable_snapshot(payload: object) -> Path:
         not isinstance(raw_path, str)
         or not isinstance(expected_hash, str)
         or len(expected_hash) != 64
+        or any(character not in "0123456789abcdef" for character in expected_hash)
         or not isinstance(expected_size, int)
         or isinstance(expected_size, bool)
         or expected_size < 0
@@ -196,12 +222,23 @@ def validate_executable_snapshot(payload: object) -> Path:
     if not stored_path.is_absolute():
         raise ValueError("Approval executable path is not absolute.")
 
-    actual = fingerprint_executable(stored_path)
-    if actual.path != stored_path:
+    return ExecutableSnapshot(stored_path, expected_hash, expected_size)
+
+
+def validate_executable_snapshot(payload: object) -> Path:
+    """Re-hash a stored primary executable immediately before launch.
+
+    This is the final user-space identity check. It does not eliminate the
+    narrow race between returning the canonical path and the OS opening it.
+    """
+    expected = parse_executable_snapshot(payload)
+
+    actual = fingerprint_executable(expected.path)
+    if actual.path != expected.path:
         raise ValueError("Approval executable canonical path changed.")
-    if actual.size != expected_size or not hmac.compare_digest(
+    if actual.size != expected.size or not hmac.compare_digest(
         actual.sha256,
-        expected_hash,
+        expected.sha256,
     ):
         raise ValueError("Approved executable content changed.")
     return actual.path

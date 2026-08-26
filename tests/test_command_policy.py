@@ -138,15 +138,27 @@ def test_relative_executable_path_is_never_low(temp_dir):
 
 
 @pytest.mark.parametrize("launcher", ["py", "py.exe"])
-def test_windows_python_launcher_is_never_low(temp_dir, launcher):
+def test_windows_python_launcher_is_always_high(temp_dir, launcher):
     workspace = (temp_dir / "workspace").resolve()
     workspace.mkdir()
 
     decision = _assess(launcher, ["--version"], workspace=workspace)
 
-    assert decision.level == RiskLevel.MEDIUM
+    assert decision.level == RiskLevel.HIGH
     assert decision.profile is None
     assert decision.executable.trusted is False
+    assert "selects another Python interpreter" in decision.reason
+
+
+@pytest.mark.parametrize("script", ["build.cmd", "build.bat"])
+def test_windows_batch_scripts_are_high(temp_dir, script):
+    workspace = (temp_dir / "workspace").resolve()
+    workspace.mkdir()
+
+    decision = _assess(script, ["safe-looking"], workspace=workspace)
+
+    assert decision.level == RiskLevel.HIGH
+    assert "command interpreter" in decision.reason
 
 
 @pytest.mark.parametrize(

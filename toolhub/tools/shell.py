@@ -21,6 +21,7 @@ from toolhub.security.paths import (
     get_workspace_root,
     relative_workspace_path,
     resolve_workspace_path,
+    validate_workspace_snapshot,
 )
 from toolhub.security.risk import RiskLevel
 
@@ -369,7 +370,10 @@ def run_shell(
         raise
 
     executable_metadata = executable_snapshot.to_payload()
-    policy_metadata["approval_executable"] = executable_metadata
+    policy_metadata["approval_executable"] = executable_snapshot.audit_metadata(
+        requested_program=program,
+        workspace_root=get_workspace_root(),
+    )
     request = approval.create_request(
         program=program,
         args=command_args,
@@ -491,10 +495,6 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             message=f"Unknown approval request: {request_id}",
         )
 
-    stored_policy = request.payload.get("command_policy")
-    if isinstance(stored_policy, dict):
-        policy_metadata = stored_policy
-
     if request.status != ApprovalStatus.APPROVED:
         audit_rejection(
             status=request.status,
@@ -515,37 +515,27 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             message=f"Request is {request.status.value}; cannot execute.",
         )
 
-    approved_workspace = request.payload.get("workspace_root")
-    if approved_workspace is not None:
-        try:
-            workspace_matches = (
-                Path(str(approved_workspace)).resolve(strict=True)
-                == get_workspace_root()
-            )
-        except (OSError, RuntimeError):
-            workspace_matches = False
-
-        if not workspace_matches:
-            message = "Approval was created for a different ToolHub workspace."
-            audit_rejection(
-                status=request.status,
-                program=request.program,
-                args=request.args,
-                cwd=request.cwd,
-                risk=request.risk,
-                error=message,
-                error_type="WorkspaceBoundaryViolation",
-            )
-            return _rejected_result(
-                request_id,
-                program=request.program,
-                args=request.args,
-                cwd=request.cwd,
-                risk=request.risk,
-                risk_reason=request.risk_reason,
-                status=request.status,
-                message=message,
-            )
+    if request.kind != "shell":
+        message = f"Approval request kind is {request.kind!r}; expected 'shell'."
+        audit_rejection(
+            status=request.status,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            error=message,
+            error_type="ApprovalKindMismatch",
+        )
+        return _rejected_result(
+            request_id,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            risk_reason=request.risk_reason,
+            status=request.status,
+            message=message,
+        )
 
     # Atomically APPROVED -> CONSUMED. Single-use: a second call fails here.
     consumed = approval.consume_request(request_id)
@@ -572,10 +562,38 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             message=f"Approval could not be consumed (status {status.value}).",
         )
 
+    stored_policy = consumed.payload.get("command_policy")
+    if isinstance(stored_policy, dict):
+        policy_metadata = stored_policy
+
+    try:
+        validate_workspace_snapshot(consumed.payload, get_workspace_root())
+    except (TypeError, ValueError) as exc:
+        message = f"Approval workspace identity is invalid: {exc}"
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error=message,
+            error_type="WorkspaceBoundaryViolation",
+        )
+        return _rejected_result(
+            request_id,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            risk_reason=consumed.risk_reason,
+            status=consumed.status,
+            message=message,
+        )
+
     # Re-validate the stored cwd against the workspace (defense in depth).
     try:
         working_directory = resolve_workspace_path(consumed.cwd)
-    except ValueError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         audit_rejection(
             status=consumed.status,
             program=consumed.program,

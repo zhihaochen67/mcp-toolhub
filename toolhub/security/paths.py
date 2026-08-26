@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,3 +153,33 @@ def relative_workspace_path(path: Path) -> str:
         return "."
 
     return relative.as_posix()
+
+
+def validate_workspace_snapshot(
+    payload: object,
+    root: Path | None = None,
+) -> Path:
+    """Require an approval payload bound to one canonical workspace."""
+    if not isinstance(payload, Mapping):
+        raise TypeError("Approval payload is malformed")
+
+    raw_snapshot = payload.get("workspace_root")
+    if not isinstance(raw_snapshot, str) or not raw_snapshot.strip():
+        raise ValueError("Approval workspace snapshot is missing or malformed")
+
+    snapshot = Path(raw_snapshot)
+    if not snapshot.is_absolute():
+        raise ValueError("Approval workspace snapshot is not absolute")
+
+    try:
+        approved_root = snapshot.resolve(strict=True)
+        current_root = (root or get_workspace_root()).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            "Approval workspace no longer exists or cannot be resolved"
+        ) from exc
+
+    if approved_root != current_root:
+        raise ValueError("Approval was created for a different ToolHub workspace")
+
+    return approved_root

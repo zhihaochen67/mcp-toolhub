@@ -47,6 +47,7 @@ from toolhub.security.paths import (
     MAX_FILE_SIZE,
     get_workspace_root,
     resolve_path_within,
+    validate_workspace_snapshot,
 )
 from toolhub.security.risk import RiskLevel
 
@@ -502,32 +503,6 @@ def _validate_payload(request: ApprovalRequest, kind: str, required: set[str]) -
     return payload
 
 
-def _validate_workspace_snapshot(payload: dict, root: Path) -> None:
-    """Refuse a new-style approval captured for another workspace.
-
-    Older stored approvals did not carry this field, so absence remains
-    backward-compatible. Every request created by this version includes the
-    canonical root and is therefore bound across server restarts as well as
-    within one process.
-    """
-
-    snapshot = payload.get("workspace_root")
-    if snapshot is None:
-        return
-
-    try:
-        approved_root = Path(str(snapshot)).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(
-            "Approval workspace no longer exists or cannot be resolved"
-        ) from exc
-
-    if approved_root != root.resolve():
-        raise ValueError(
-            "Approval was created for a different ToolHub workspace"
-        )
-
-
 # --------------------------------------------------------------------------
 # Read tool
 # --------------------------------------------------------------------------
@@ -723,7 +698,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
         payload = _validate_payload(
             request, "file_write", {"path", "content", "expected_hash", "create_parents"}
         )
-        _validate_workspace_snapshot(payload, root)
+        validate_workspace_snapshot(payload, root)
         path = str(payload["path"])
         content = str(payload["content"])
         expected_hash = payload.get("expected_hash")
@@ -744,7 +719,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
         new_hash = _sha256_file(target)
         bytes_written = len(content.encode("utf-8"))
 
-    except (FileNotFoundError, ValueError, OSError) as exc:
+    except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool=tool,
@@ -950,7 +925,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         payload = _validate_payload(
             request, "file_patch", {"path", "patch", "expected_hash"}
         )
-        _validate_workspace_snapshot(payload, root)
+        validate_workspace_snapshot(payload, root)
         path = str(payload["path"])
         patch = str(payload["patch"])
         expected_hash = payload.get("expected_hash")
@@ -981,7 +956,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
 
         new_hash = _sha256_file(target)
 
-    except (FileNotFoundError, ValueError, OSError) as exc:
+    except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool=tool,

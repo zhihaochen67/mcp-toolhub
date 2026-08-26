@@ -15,6 +15,7 @@ import pytest
 from toolhub.observability import audit
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalStatus
+from toolhub.security.risk import RiskLevel
 from toolhub.tools.filesystem import (
     MAX_PATCH_CHARS,
     MAX_WRITE_BYTES,
@@ -479,6 +480,48 @@ def test_approval_cannot_replay(temp_dir):
     assert second.executed is False
     assert second.approval_status == ApprovalStatus.CONSUMED
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "first"
+
+
+@pytest.mark.parametrize(
+    "workspace_case",
+    ["missing", "none", "wrong-type", "empty", "relative", "mismatch"],
+)
+def test_write_approval_requires_strict_workspace_snapshot(
+    temp_dir,
+    workspace_case,
+):
+    payload = {
+        "path": "blocked.txt",
+        "content": "must not be written",
+        "expected_hash": None,
+        "create_parents": False,
+    }
+    workspace_values = {
+        "none": None,
+        "wrong-type": 123,
+        "empty": "",
+        "relative": ".",
+        "mismatch": str(temp_dir.parent.resolve()),
+    }
+    if workspace_case != "missing":
+        payload["workspace_root"] = workspace_values[workspace_case]
+
+    request = approval.create_request(
+        kind="file_write",
+        risk=RiskLevel.MEDIUM,
+        risk_reason="test",
+        payload=payload,
+    )
+    approval.approve_request(request.request_id)
+
+    with pytest.raises(ValueError, match="workspace"):
+        write_file_approved(request.request_id, root=temp_dir)
+
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
+    replay = write_file_approved(request.request_id, root=temp_dir)
+    assert replay.executed is False
+    assert replay.approval_status == ApprovalStatus.CONSUMED
+    assert not (temp_dir / "blocked.txt").exists()
 
 
 def test_expired_approval_blocks_execution(temp_dir, monkeypatch):

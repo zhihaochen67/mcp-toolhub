@@ -53,10 +53,12 @@ DESTRUCTIVE_PROGRAMS = frozenset(
 )
 
 PYTHON_NAMES = frozenset(
-    {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+    {"python", "python.exe", "python3", "python3.exe"}
 )
+PYTHON_LAUNCHER_NAMES = frozenset({"py", "py.exe"})
 PYTEST_NAMES = frozenset({"pytest", "pytest.exe"})
 GIT_NAMES = frozenset({"git", "git.exe"})
+WINDOWS_SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd"})
 
 # These are policy aliases, not PATH lookups. In a LOW profile they mean the
 # already-running ToolHub runtime. The Windows py launcher is intentionally
@@ -101,15 +103,32 @@ class ExecutableIdentity:
     path_name: str | None = None
 
     def audit_metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "lookup": self.lookup,
-            "resolved_path": (
-                str(self.resolved_path) if self.resolved_path is not None else None
-            ),
             "trusted": self.trusted,
             "reason": self.reason,
-            "path_name": self.path_name,
+            "requested_name": self.path_name,
+            "resolved_name": (
+                self.resolved_path.name
+                if self.resolved_path is not None
+                else self.path_name
+            ),
         }
+        if self.lookup == "toolhub_runtime":
+            metadata["scope"] = "toolhub_runtime"
+        elif self.resolved_path is None:
+            metadata["scope"] = "unresolved"
+        else:
+            try:
+                workspace_path = self.resolved_path.relative_to(
+                    get_workspace_root()
+                )
+            except ValueError:
+                metadata["scope"] = "external"
+            else:
+                metadata["scope"] = "workspace"
+                metadata["workspace_path"] = workspace_path.as_posix()
+        return metadata
 
 
 @dataclass(frozen=True)
@@ -292,6 +311,20 @@ def assess_shell_command(
         return CommandPolicyDecision(
             RiskLevel.HIGH,
             f"Destructive executable detected: {requested_name}",
+            _unverified_identity(program, working_directory),
+        )
+
+    if requested_name in PYTHON_LAUNCHER_NAMES:
+        return CommandPolicyDecision(
+            RiskLevel.HIGH,
+            "The py launcher selects another Python interpreter at execution time.",
+            _unverified_identity(program, working_directory),
+        )
+
+    if ntpath.splitext(requested_name)[1].casefold() in WINDOWS_SCRIPT_EXTENSIONS:
+        return CommandPolicyDecision(
+            RiskLevel.HIGH,
+            "Windows batch scripts execute through a command interpreter.",
             _unverified_identity(program, working_directory),
         )
 
