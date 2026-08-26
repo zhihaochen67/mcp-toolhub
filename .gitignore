@@ -13,3 +13,6 @@ wheels/
 .toolhub/
 .pytest_cache/
 .test-tmp/
+
+# Repo Doctor integration test workspaces
+.repo-doctor-*/
