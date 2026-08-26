@@ -137,7 +137,9 @@ def _candidate_names(
 ) -> tuple[str, ...]:
     if not _WINDOWS or Path(program).suffix:
         return (program,)
-    return tuple(f"{program}{extension}" for extension in _windows_extensions(environment))
+    return tuple(
+        f"{program}{extension}" for extension in _windows_extensions(environment)
+    )
 
 
 def _search_directories(
@@ -173,8 +175,7 @@ def resolve_executable_snapshot(
         if not candidate.is_absolute():
             candidate = working_directory / candidate
         candidates = (
-            candidate.with_name(name)
-            for name in _candidate_names(candidate.name, env)
+            candidate.with_name(name) for name in _candidate_names(candidate.name, env)
         )
     else:
         candidates = (

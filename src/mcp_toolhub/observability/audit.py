@@ -4,8 +4,8 @@ A minimal, defensive, append-only JSON Lines audit log.
 
 Security / privacy properties
 -----------------------------
-* Events live outside the agent workspace: ``.toolhub/audit.jsonl`` by
-  default (override with ``TOOLHUB_AUDIT_PATH``).
+* Events live under the trusted ToolHub state root, outside the agent
+  workspace.
 * Trace IDs are cryptographically random (``secrets``) and therefore
   unpredictable and unguessable.
 * The log stores metadata and bounded summaries only: no full file contents,
@@ -14,7 +14,7 @@ Security / privacy properties
 * ``record_event`` never raises: if the log cannot be written, the failure is
   swallowed so auditing can never break the main tool path.
 * This module has no MCP dependency: MCP-facing surfaces (e.g. the read-only
-  ``toolhub.audit_recent`` tool) live in ``toolhub.tools.audit``.
+  ``toolhub.audit_recent`` tool) live in ``mcp_toolhub.tools.audit``.
 """
 
 from __future__ import annotations
@@ -28,9 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from toolhub.security.paths import STATE_ROOT
-
-DEFAULT_AUDIT_PATH = STATE_ROOT / "audit.jsonl"
+from mcp_toolhub.security.paths import get_state_root
 
 MAX_STRING_CHARS = 200
 MAX_COLLECTION_ITEMS = 20
@@ -64,10 +62,7 @@ def _now_iso() -> str:
 
 
 def _default_audit_path() -> Path:
-    value = os.environ.get("TOOLHUB_AUDIT_PATH")
-    if value:
-        return Path(value).expanduser().resolve()
-    return DEFAULT_AUDIT_PATH
+    return get_state_root() / "audit.jsonl"
 
 
 def _truncate(value: str, limit: int) -> str:

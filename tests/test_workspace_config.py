@@ -9,33 +9,31 @@ from pathlib import Path
 
 import pytest
 
-from toolhub.observability import audit
-from toolhub.observability.audit import DEFAULT_AUDIT_PATH
-from toolhub.security import approval
-from toolhub.security.approval import DEFAULT_STORE_PATH
-from toolhub.security.paths import (
-    DEFAULT_WORKSPACE_ROOT,
-    PROJECT_ROOT,
-    STATE_ROOT,
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.paths import (
+    RuntimeConfigurationError,
+    StateConfigurationError,
     WorkspaceConfigurationError,
-    _reset_workspace_configuration_for_tests,
+    _reset_runtime_configuration_for_tests,
+    get_state_root,
     get_workspace_root,
-    initialize_workspace_configuration,
+    initialize_runtime_configuration,
 )
-from toolhub.tools.filesystem import (
+from mcp_toolhub.tools.filesystem import (
     apply_patch,
     apply_patch_approved,
     read_file,
     write_file,
     write_file_approved,
 )
-from toolhub.tools.git import git_diff, git_status
-from toolhub.tools.shell import run_shell
+from mcp_toolhub.tools.git import git_diff, git_status
+from mcp_toolhub.tools.shell import run_shell
 
 
 def _configure(monkeypatch, root: Path | str) -> Path:
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(root))
-    _reset_workspace_configuration_for_tests()
+    _reset_runtime_configuration_for_tests()
     return get_workspace_root()
 
 
@@ -50,34 +48,73 @@ def _patch(name: str, old: str, new: str) -> str:
     )
 
 
-def test_default_workspace_is_unchanged_without_environment_variable():
-    assert "TOOLHUB_WORKSPACE_ROOT" not in os.environ
-    assert get_workspace_root() == DEFAULT_WORKSPACE_ROOT
-    assert get_workspace_root() == (PROJECT_ROOT / "workspace").resolve()
+def test_workspace_is_required(monkeypatch):
+    monkeypatch.delenv("TOOLHUB_WORKSPACE_ROOT", raising=False)
+    _reset_runtime_configuration_for_tests()
+
+    with pytest.raises(WorkspaceConfigurationError, match="is required"):
+        get_workspace_root()
 
 
-def test_external_relative_workspace_is_canonical_and_frozen(
-    temp_dir, monkeypatch
-):
+def test_relative_workspace_is_rejected(temp_dir, monkeypatch):
     monkeypatch.chdir(temp_dir.parent)
-    configured = _configure(monkeypatch, temp_dir.name)
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", temp_dir.name)
+    _reset_runtime_configuration_for_tests()
+
+    with pytest.raises(WorkspaceConfigurationError, match="must be absolute"):
+        get_workspace_root()
+
+
+def test_external_workspace_is_canonical_and_frozen(temp_dir, monkeypatch):
+    configured = _configure(monkeypatch, temp_dir)
+    configured_state = get_state_root()
 
     assert configured == temp_dir.resolve()
     assert configured.is_absolute()
-    assert initialize_workspace_configuration().configured_from_env is True
+    assert initialize_runtime_configuration().workspace_root == configured
 
     other = temp_dir / "other-workspace"
     other.mkdir()
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(other))
+    monkeypatch.setenv(
+        "TOOLHUB_STATE_ROOT", str((temp_dir.parent / "ignored-state").resolve())
+    )
 
     # Startup configuration is immutable even if trusted process state is
     # changed later; all tools continue to share one boundary.
     assert get_workspace_root() == temp_dir.resolve()
+    assert get_state_root() == configured_state
 
 
-def test_filesystem_read_uses_configured_external_workspace(
-    temp_dir, monkeypatch
-):
+def test_default_state_root_uses_platform_directory(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "platform-state"
+    workspace.mkdir()
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace.resolve()))
+    monkeypatch.delenv("TOOLHUB_STATE_ROOT", raising=False)
+    monkeypatch.setattr(
+        "mcp_toolhub.security.paths.user_state_path",
+        lambda *_args, **_kwargs: state_root,
+    )
+    _reset_runtime_configuration_for_tests()
+
+    configuration = initialize_runtime_configuration()
+
+    assert configuration.state_root == state_root.resolve()
+    assert state_root.is_dir()
+
+
+@pytest.mark.parametrize("value", ["", "relative/state"])
+def test_invalid_state_root_value_is_rejected(temp_dir, monkeypatch, value):
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(temp_dir.resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", value)
+    _reset_runtime_configuration_for_tests()
+
+    with pytest.raises(StateConfigurationError):
+        initialize_runtime_configuration()
+
+
+def test_filesystem_read_uses_configured_external_workspace(temp_dir, monkeypatch):
     (temp_dir / "readme.txt").write_text("external\n", encoding="utf-8")
     _configure(monkeypatch, temp_dir)
 
@@ -111,9 +148,7 @@ def test_write_and_patch_approvals_are_bound_to_external_workspace(
     assert (root / "new.txt").read_text(encoding="utf-8") == "new\n"
 
 
-def test_shell_cwd_uses_configured_external_workspace(
-    temp_dir, monkeypatch
-):
+def test_shell_cwd_uses_configured_external_workspace(temp_dir, monkeypatch):
     _configure(monkeypatch, temp_dir)
     calls = []
 
@@ -123,7 +158,7 @@ def test_shell_cwd_uses_configured_external_workspace(
             command, 0, stdout="Python 3.13\n", stderr=""
         )
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     result = run_shell("python", ["--version"])
 
@@ -147,9 +182,7 @@ def test_git_status_and_diff_use_configured_external_workspace(
     assert "+two" in diff.raw
 
 
-def test_traversal_outside_external_workspace_is_rejected(
-    temp_dir, monkeypatch
-):
+def test_traversal_outside_external_workspace_is_rejected(temp_dir, monkeypatch):
     outside = temp_dir.parent / "outside-workspace.txt"
     outside.write_text("secret", encoding="utf-8")
     _configure(monkeypatch, temp_dir)
@@ -191,11 +224,12 @@ def test_toolhub_state_stays_outside_workspace_and_is_not_agent_readable(
     temp_dir, isolated_approval_store, monkeypatch
 ):
     root = _configure(monkeypatch, temp_dir)
-    audit_path = Path(os.environ["TOOLHUB_AUDIT_PATH"])
+    state_root = get_state_root()
+    audit_path = state_root / "audit.jsonl"
 
-    assert DEFAULT_STORE_PATH == STATE_ROOT / "approvals.json"
-    assert DEFAULT_AUDIT_PATH == STATE_ROOT / "audit.jsonl"
-    assert not STATE_ROOT.is_relative_to(root)
+    assert isolated_approval_store == state_root / "approvals.json"
+    assert audit_path == state_root / "audit.jsonl"
+    assert not state_root.is_relative_to(root)
     assert not isolated_approval_store.is_relative_to(root)
     assert not audit_path.is_relative_to(root)
 
@@ -217,18 +251,18 @@ def test_toolhub_state_stays_outside_workspace_and_is_not_agent_readable(
 def test_invalid_workspace_configuration_fails_clearly(temp_dir, monkeypatch):
     missing = temp_dir / "does-not-exist"
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(missing))
-    _reset_workspace_configuration_for_tests()
+    _reset_runtime_configuration_for_tests()
 
     with pytest.raises(
         WorkspaceConfigurationError,
         match="Invalid TOOLHUB_WORKSPACE_ROOT.*does not exist",
     ):
-        initialize_workspace_configuration()
+        initialize_runtime_configuration()
 
     not_directory = temp_dir / "file.txt"
     not_directory.write_text("x", encoding="utf-8")
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(not_directory))
-    _reset_workspace_configuration_for_tests()
+    _reset_runtime_configuration_for_tests()
 
     with pytest.raises(
         WorkspaceConfigurationError,
@@ -237,20 +271,19 @@ def test_invalid_workspace_configuration_fails_clearly(temp_dir, monkeypatch):
         get_workspace_root()
 
 
-def test_workspace_cannot_contain_trusted_toolhub_state(monkeypatch):
-    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(PROJECT_ROOT))
-    _reset_workspace_configuration_for_tests()
+def test_workspace_cannot_contain_trusted_toolhub_state(temp_dir, monkeypatch):
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(temp_dir.resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str((temp_dir / "state").resolve()))
+    _reset_runtime_configuration_for_tests()
 
     with pytest.raises(
-        WorkspaceConfigurationError,
-        match="contains trusted ToolHub state root",
+        RuntimeConfigurationError,
+        match="TOOLHUB_STATE_ROOT must be outside",
     ):
-        initialize_workspace_configuration()
+        initialize_runtime_configuration()
 
 
-def test_external_git_repository_integration_smoke_flow(
-    git_repo, run_git, monkeypatch
-):
+def test_external_git_repository_integration_smoke_flow(git_repo, run_git, monkeypatch):
     root = _configure(monkeypatch, git_repo)
     (root / "flow.txt").write_text("before\n", encoding="utf-8")
     run_git("add", "flow.txt", cwd=root)
@@ -267,7 +300,7 @@ def test_external_git_repository_integration_smoke_flow(
     # The shell and git modules share Python's subprocess module object, so
     # scope the shell mock to this one execution before exercising real git.
     with monkeypatch.context() as shell_patch:
-        shell_patch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+        shell_patch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
         shell = run_shell("python", ["--version"])
 
     status = git_status()

@@ -11,7 +11,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from toolhub.observability import audit
+from mcp_toolhub.observability import audit
 
 
 class AuditRecentResult(BaseModel):

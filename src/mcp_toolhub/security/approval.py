@@ -6,13 +6,13 @@ shell commands.
 Security properties
 -------------------
 * Approval decisions are made out-of-band by a trusted local administrator
-  (``python -m toolhub.admin``). The MCP agent has no tool that can approve,
+  (``mcp-toolhub-admin``). The MCP agent has no tool that can approve,
   reject, or mutate requests: it can only create PENDING requests and run
   already-APPROVED ones.
 * Request IDs are cryptographically random (``secrets``), so the agent cannot
   predict or forge a request ID for a command it invented.
-* The store lives outside the agent workspace (``.toolhub/approvals.json`` by
-  default) and is written atomically (temp file + ``os.replace``) under a
+* The store lives under the trusted per-user ToolHub state root and is written
+  atomically (temp file + ``os.replace``) under a
   cross-process advisory lock, so the CLI and the MCP server can safely share
   it as separate processes.
 * Approvals are single-use: the only path from APPROVED to execution goes
@@ -34,8 +34,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
 
-from toolhub.security.paths import STATE_ROOT
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.paths import get_state_root
+from mcp_toolhub.security.risk import RiskLevel
 
 
 class ApprovalStatus(str, Enum):
@@ -79,7 +79,6 @@ class ApprovalRequest(BaseModel):
 # --------------------------------------------------------------------------
 
 DEFAULT_TTL_SECONDS = 300  # 5 minutes
-DEFAULT_STORE_PATH = STATE_ROOT / "approvals.json"
 STORE_VERSION = 1
 
 LOCK_TIMEOUT_SECONDS = 5.0
@@ -91,10 +90,7 @@ def _now() -> datetime:
 
 
 def _default_store_path() -> Path:
-    value = os.environ.get("TOOLHUB_APPROVAL_STORE")
-    if value:
-        return Path(value).expanduser().resolve()
-    return DEFAULT_STORE_PATH
+    return get_state_root() / "approvals.json"
 
 
 def _default_ttl_seconds() -> int:
@@ -206,9 +202,7 @@ def _store_lock(store_path: Path) -> Iterator[None]:
                 pass
 
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Approval store is locked: {lock_path}"
-                )
+                raise TimeoutError(f"Approval store is locked: {lock_path}")
             time.sleep(0.05)
 
     try:
@@ -384,9 +378,7 @@ def approve_request(
         raise ValueError(f"Approval request expired: {request_id}")
 
     if not changed or result.status != ApprovalStatus.APPROVED:
-        raise ValueError(
-            f"Approval request is {result.status.value}: {request_id}"
-        )
+        raise ValueError(f"Approval request is {result.status.value}: {request_id}")
 
     return result
 
@@ -413,9 +405,7 @@ def reject_request(
         raise ValueError(f"Approval request expired: {request_id}")
 
     if not changed or result.status != ApprovalStatus.REJECTED:
-        raise ValueError(
-            f"Approval request is {result.status.value}: {request_id}"
-        )
+        raise ValueError(f"Approval request is {result.status.value}: {request_id}")
 
     return result
 
@@ -459,9 +449,10 @@ def list_requests(
     results: list[ApprovalRequest] = []
 
     for request in _read_store(path).values():
-        if request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED} and _expired(
-            request, current
-        ):
+        if request.status in {
+            ApprovalStatus.PENDING,
+            ApprovalStatus.APPROVED,
+        } and _expired(request, current):
             request = request.model_copy(update={"status": ApprovalStatus.EXPIRED})
         results.append(request)
 

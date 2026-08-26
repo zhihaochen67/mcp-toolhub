@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalStatus
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalStatus
+from mcp_toolhub.security.risk import RiskLevel
 
 
 def _create_request(**kwargs):

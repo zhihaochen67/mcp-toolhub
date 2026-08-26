@@ -5,9 +5,9 @@ approve or reject approval requests. It is intended for a human operator, not
 the MCP agent: the agent has no tool that can reach this code path.
 
 Usage:
-    uv run python -m toolhub.admin list
-    uv run python -m toolhub.admin approve <request_id>
-    uv run python -m toolhub.admin reject <request_id>
+    mcp-toolhub-admin list
+    mcp-toolhub-admin approve <request_id>
+    mcp-toolhub-admin reject <request_id>
 """
 
 from __future__ import annotations
@@ -17,11 +17,16 @@ import hashlib
 import json
 import sys
 
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalRequest, ApprovalStatus
-from toolhub.security.executable_snapshot import (
+from mcp_toolhub import __version__
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalRequest, ApprovalStatus
+from mcp_toolhub.security.executable_snapshot import (
     parse_executable_snapshot,
     validate_executable_snapshot,
+)
+from mcp_toolhub.security.paths import (
+    RuntimeConfigurationError,
+    initialize_runtime_configuration,
 )
 
 
@@ -68,9 +73,7 @@ def _describe_shell(request: ApprovalRequest) -> str:
     ]
 
     try:
-        snapshot = parse_executable_snapshot(
-            request.payload.get("executable_snapshot")
-        )
+        snapshot = parse_executable_snapshot(request.payload.get("executable_snapshot"))
     except (TypeError, ValueError) as exc:
         lines.append(f"  executable_snapshot:  INVALID ({exc})")
     else:
@@ -150,17 +153,13 @@ def cmd_approve(args: argparse.Namespace) -> int:
 
     if request.kind == "shell":
         try:
-            validate_executable_snapshot(
-                request.payload.get("executable_snapshot")
-            )
+            validate_executable_snapshot(request.payload.get("executable_snapshot"))
         except (TypeError, ValueError) as exc:
             print(f"error: Invalid executable snapshot: {exc}", file=sys.stderr)
             return 1
 
     try:
-        confirmation = input(
-            f"Type APPROVE to approve {request.request_id}: "
-        )
+        confirmation = input(f"Type APPROVE to approve {request.request_id}: ")
     except EOFError:
         confirmation = ""
 
@@ -198,9 +197,10 @@ def cmd_reject(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="toolhub.admin",
+        prog="mcp-toolhub-admin",
         description="Trusted local administrator CLI for MCP ToolHub approvals.",
     )
+    parser.add_argument("--version", action="version", version=__version__)
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -229,6 +229,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        initialize_runtime_configuration()
+    except RuntimeConfigurationError as exc:
+        print(f"mcp-toolhub-admin: {exc}", file=sys.stderr)
+        return 2
     return args.func(args)
 
 

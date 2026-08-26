@@ -9,8 +9,8 @@ import subprocess
 
 import pytest
 
-from toolhub.observability import audit
-from toolhub.tools.git import GIT_TIMEOUT_SECONDS, git_diff, git_status
+from mcp_toolhub.observability import audit
+from mcp_toolhub.tools.git import GIT_TIMEOUT_SECONDS, git_diff, git_status
 
 
 def _write(repo, name, content):
@@ -114,7 +114,7 @@ def test_git_tools_accept_no_arbitrary_arguments():
     import anyio
     from mcp.server import MCPServer
 
-    from toolhub.tools.git import register_git_tools
+    from mcp_toolhub.tools.git import register_git_tools
 
     srv = MCPServer("test")
     register_git_tools(srv)
@@ -177,7 +177,7 @@ def test_git_tools_do_not_modify_repo(git_repo):
 
 
 def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
-    from toolhub.tools import git as git_tools
+    from mcp_toolhub.tools import git as git_tools
 
     calls = []
 
@@ -289,11 +289,7 @@ def test_git_status_ignores_fsmonitor_hook_path(git_repo):
 
     marker = git_repo / "fsmonitor-hook-ran.marker"
     hook = git_repo / "fake-fsmonitor.sh"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f"echo ran > '{marker.as_posix()}'\n"
-        "exit 0\n"
-    )
+    hook.write_text(f"#!/bin/sh\necho ran > '{marker.as_posix()}'\nexit 0\n")
     _git(git_repo, "config", "core.fsmonitor", str(hook))
 
     result = git_status(root=git_repo)
