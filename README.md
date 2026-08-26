@@ -3,7 +3,8 @@
 MCP ToolHub is a local, stdio-only Model Context Protocol server that exposes
 bounded workspace filesystem operations, read-only Git inspection, structured
 command execution, and an audit trail. Mutating filesystem operations and all
-external command execution use the existing out-of-band human approval model.
+agent-selected external shell commands use the existing out-of-band human
+approval model.
 
 ToolHub does not expose an HTTP, SSE, or other network listener.
 
@@ -57,14 +58,23 @@ checkout, or installation directory.
 ### Trusted state root
 
 `TOOLHUB_STATE_ROOT` optionally selects the directory containing
-`approvals.json` and `audit.jsonl`. It must be absolute when provided. When it
-is unset, ToolHub uses the platform-appropriate per-user state directory from
-`platformdirs`.
+`workspace-binding.json`, `approvals.json`, and `audit.jsonl`. It must be
+absolute when provided. The directory is permanently bound on first valid use
+to exactly one canonical workspace; reusing it for another workspace fails
+closed.
+
+When `TOOLHUB_STATE_ROOT` is unset, ToolHub uses the platform-appropriate
+per-user state directory from `platformdirs` as a base. Each canonical
+workspace receives an independent namespace below `workspaces/`, named with a
+deterministic SHA-256 identifier derived from the platform-normalized canonical
+workspace path. The identifier avoids placing the workspace path in directory
+names, but it is namespace separation rather than an authentication secret.
+Moving or renaming a workspace normally creates a new default namespace.
 
 The state directory is created as needed, canonicalized, and frozen with the
 workspace configuration. Startup fails if the state root is inside the
 workspace. The server and administrator CLI must run as the same user and with
-the same environment so they share this state.
+the same workspace and state configuration so they share this state.
 
 ### POSIX example
 
@@ -288,6 +298,8 @@ server/admin shared-state tests from outside the repository.
 - **Workspace is not a directory**: create the directory or correct the path.
 - **State root must be outside the workspace**: move `TOOLHUB_STATE_ROOT` to a
   trusted directory the MCP filesystem tools cannot address.
+- **State namespace belongs to a different workspace**: select a different
+  explicit `TOOLHUB_STATE_ROOT`; bindings are never silently reassigned.
 - **Client reports invalid stdio JSON**: verify wrappers and startup scripts do
   not print banners or logs to stdout.
 - **Admin cannot see a request**: confirm server and admin run as the same user

@@ -61,6 +61,7 @@ def test_shell_identity_is_shown_unambiguously_before_approval(
     def confirm(prompt):
         displayed = capsys.readouterr().out
         assert "Approval candidate:" in displayed
+        assert json.dumps(str(get_workspace_root()), ensure_ascii=True) in displayed
         assert json.dumps(request.program, ensure_ascii=True) in displayed
         assert json.dumps(str(executable.resolve()), ensure_ascii=True) in displayed
         assert snapshot["sha256"] in displayed

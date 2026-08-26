@@ -83,6 +83,20 @@ def _runtime_environment(workspace: Path, state_root: Path) -> dict[str, str]:
     return environment
 
 
+def _default_state_environment(workspace: Path, state_base: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("TOOLHUB_STATE_ROOT", None)
+    environment["TOOLHUB_WORKSPACE_ROOT"] = str(workspace.resolve())
+    if os.name == "nt":
+        environment["LOCALAPPDATA"] = str(state_base.resolve())
+        environment["APPDATA"] = str(state_base.resolve())
+    else:
+        environment["XDG_STATE_HOME"] = str(state_base.resolve())
+    return environment
+
+
 def _json_result(result) -> dict:
     assert result.is_error is False
     texts = [item.text for item in result.content if hasattr(item, "text")]
@@ -172,6 +186,167 @@ def test_stdio_initialize_tools_ping_workspace_and_admin_state(external_runtime_
         workspace,
         state_root,
         launch_directory,
+    )
+
+
+async def _admin_command(
+    admin: str,
+    arguments: list[str],
+    *,
+    launch_directory: Path,
+    environment: dict[str, str],
+    confirmation: bool = False,
+) -> tuple[int, str, str]:
+    result = await anyio.run_process(
+        [admin, *arguments],
+        input=b"APPROVE\n" if confirmation else None,
+        cwd=str(launch_directory),
+        env=environment,
+        check=False,
+    )
+    return (
+        result.returncode,
+        result.stdout.decode(errors="replace"),
+        result.stderr.decode(errors="replace"),
+    )
+
+
+async def _exercise_two_workspace_isolation(
+    server: str,
+    admin: str,
+    root: Path,
+) -> None:
+    workspace_a = root / "workspace-a"
+    workspace_b = root / "workspace-b"
+    state_base = root / "user-state-base"
+    launch_a = root / "launch-a"
+    launch_b = root / "launch-b"
+    for directory in (workspace_a, workspace_b, state_base, launch_a, launch_b):
+        directory.mkdir()
+
+    environment_a = _default_state_environment(workspace_a, state_base)
+    environment_b = _default_state_environment(workspace_b, state_base)
+    parameters_a = StdioServerParameters(
+        command=server,
+        args=["serve"],
+        cwd=launch_a,
+        env=environment_a,
+    )
+    parameters_b = StdioServerParameters(
+        command=server,
+        args=["serve"],
+        cwd=launch_b,
+        env=environment_b,
+    )
+
+    async def request(session: ClientSession) -> str:
+        result = _json_result(
+            await session.call_tool(
+                "shell.run",
+                {"program": "git", "args": ["--version"]},
+            )
+        )
+        assert result["executed"] is False
+        return result["request_id"]
+
+    async def approved(session: ClientSession, request_id: str) -> dict:
+        return _json_result(
+            await session.call_tool(
+                "shell.run_approved",
+                {"request_id": request_id},
+            )
+        )
+
+    with anyio.fail_after(45):
+        async with (
+            stdio_client(parameters_a) as streams_a,
+            ClientSession(*streams_a) as session_a,
+            stdio_client(parameters_b) as streams_b,
+            ClientSession(*streams_b) as session_b,
+        ):
+            await session_a.initialize()
+            await session_b.initialize()
+
+            request_a = await request(session_a)
+
+            code, stdout, stderr = await _admin_command(
+                admin,
+                ["list"],
+                launch_directory=launch_b,
+                environment=environment_b,
+            )
+            assert code == 0, stderr
+            assert request_a not in stdout
+
+            audit_b = _json_result(
+                await session_b.call_tool(
+                    "toolhub.audit_recent",
+                    {"limit": 100},
+                )
+            )
+            assert request_a not in json.dumps(audit_b, sort_keys=True)
+
+            code, stdout, stderr = await _admin_command(
+                admin,
+                ["approve", request_a],
+                launch_directory=launch_a,
+                environment=environment_a,
+                confirmation=True,
+            )
+            assert code == 0, stderr
+            assert json.dumps(str(workspace_a.resolve()), ensure_ascii=True) in stdout
+
+            wrong_workspace = await approved(session_b, request_a)
+            assert wrong_workspace["executed"] is False
+            assert "Unknown approval request" in wrong_workspace["message"]
+
+            code, stdout, stderr = await _admin_command(
+                admin,
+                ["list"],
+                launch_directory=launch_a,
+                environment=environment_a,
+            )
+            assert code == 0, stderr
+            assert request_a in stdout
+            assert "status:       APPROVED" in stdout
+
+            own_a = await approved(session_a, request_a)
+            assert own_a["executed"] is True
+            replay_a = await approved(session_a, request_a)
+            assert replay_a["executed"] is False
+
+            request_b = await request(session_b)
+            code, stdout, stderr = await _admin_command(
+                admin,
+                ["list"],
+                launch_directory=launch_a,
+                environment=environment_a,
+            )
+            assert code == 0, stderr
+            assert request_b not in stdout
+
+            code, stdout, stderr = await _admin_command(
+                admin,
+                ["approve", request_b],
+                launch_directory=launch_b,
+                environment=environment_b,
+                confirmation=True,
+            )
+            assert code == 0, stderr
+            assert json.dumps(str(workspace_b.resolve()), ensure_ascii=True) in stdout
+
+            wrong_workspace = await approved(session_a, request_b)
+            assert wrong_workspace["executed"] is False
+            own_b = await approved(session_b, request_b)
+            assert own_b["executed"] is True
+
+
+def test_default_state_isolated_between_two_stdio_workspaces(external_runtime_dir):
+    anyio.run(
+        _exercise_two_workspace_isolation,
+        _console_script("mcp-toolhub", "TOOLHUB_TEST_SERVER"),
+        _console_script("mcp-toolhub-admin", "TOOLHUB_TEST_ADMIN"),
+        external_runtime_dir,
     )
 
 

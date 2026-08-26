@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import stat
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +15,11 @@ from pathlib import Path
 from platformdirs import user_state_path
 
 MAX_FILE_SIZE = 256 * 1024  # 256 KB
+
+_BINDING_FILENAME = "workspace-binding.json"
+_BINDING_SCHEMA_VERSION = 1
+_BINDING_READ_TIMEOUT_SECONDS = 0.5
+_BINDING_READ_INTERVAL_SECONDS = 0.01
 
 
 class RuntimeConfigurationError(ValueError):
@@ -76,6 +85,162 @@ def _state_is_inside_workspace(state_root: Path, workspace_root: Path) -> bool:
     return True
 
 
+def _workspace_key(workspace_root: Path) -> str:
+    """Return a stable canonical workspace identity for the local platform."""
+    value = os.fspath(workspace_root)
+    if os.name == "nt":
+        value = os.path.normcase(value)
+    return value
+
+
+def _workspace_identifier(workspace_root: Path) -> str:
+    """Return a filesystem-safe, non-secret namespace identifier."""
+    identity = _workspace_key(workspace_root).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _binding_payload(workspace_root: Path) -> dict[str, object]:
+    return {
+        "schema_version": _BINDING_SCHEMA_VERSION,
+        "canonical_workspace": str(workspace_root),
+    }
+
+
+def _validate_binding_payload(payload: object, workspace_root: Path) -> None:
+    if not isinstance(payload, dict):
+        raise StateConfigurationError(
+            "Invalid workspace binding: manifest must contain a JSON object"
+        )
+
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != _BINDING_SCHEMA_VERSION
+    ):
+        raise StateConfigurationError(
+            "Invalid workspace binding: unsupported or missing schema_version"
+        )
+
+    raw_workspace = payload.get("canonical_workspace")
+    if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+        raise StateConfigurationError(
+            "Invalid workspace binding: canonical_workspace is missing or malformed"
+        )
+
+    bound_path = Path(raw_workspace)
+    if not bound_path.is_absolute():
+        raise StateConfigurationError(
+            "Invalid workspace binding: canonical_workspace is not absolute"
+        )
+
+    try:
+        bound_workspace = bound_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise StateConfigurationError(
+            "Invalid workspace binding: canonical_workspace cannot be resolved"
+        ) from exc
+
+    if not bound_workspace.is_dir():
+        raise StateConfigurationError(
+            "Invalid workspace binding: canonical_workspace is not a directory"
+        )
+
+    if _workspace_key(bound_workspace) != _workspace_key(workspace_root):
+        raise StateConfigurationError(
+            "Invalid workspace binding: state namespace belongs to a different "
+            "ToolHub workspace"
+        )
+
+
+def _read_binding_manifest(binding_path: Path, workspace_root: Path) -> None:
+    """Read a binding, tolerating only a concurrent initializer's short write."""
+    deadline = time.monotonic() + _BINDING_READ_TIMEOUT_SECONDS
+
+    while True:
+        try:
+            if binding_path.is_symlink():
+                raise StateConfigurationError(
+                    "Invalid workspace binding: manifest must not be a symlink"
+                )
+            info = binding_path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise StateConfigurationError(
+                    "Invalid workspace binding: manifest is not a regular file"
+                )
+            payload = json.loads(binding_path.read_text(encoding="utf-8"))
+        except StateConfigurationError:
+            raise
+        except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+            if time.monotonic() < deadline:
+                time.sleep(_BINDING_READ_INTERVAL_SECONDS)
+                continue
+            raise StateConfigurationError(
+                "Invalid workspace binding: manifest is unreadable or malformed"
+            ) from exc
+
+        _validate_binding_payload(payload, workspace_root)
+        return
+
+
+def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
+    """Exclusively bind one trusted state namespace to one workspace."""
+    binding_path = state_root / _BINDING_FILENAME
+    serialized = (
+        json.dumps(
+            _binding_payload(workspace_root),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    try:
+        descriptor = os.open(
+            binding_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        _read_binding_manifest(binding_path, workspace_root)
+        return
+    except OSError as exc:
+        raise StateConfigurationError(
+            f"Invalid workspace binding: cannot create manifest: {binding_path}"
+        ) from exc
+
+    try:
+        written = 0
+        while written < len(serialized):
+            count = os.write(descriptor, serialized[written:])
+            if count <= 0:
+                raise OSError("workspace binding write made no progress")
+            written += count
+        os.fsync(descriptor)
+    except OSError as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            binding_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise StateConfigurationError(
+            f"Invalid workspace binding: cannot initialize manifest: {binding_path}"
+        ) from exc
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            raise StateConfigurationError(
+                f"Invalid workspace binding: cannot finalize manifest: {binding_path}"
+            ) from exc
+
+    _read_binding_manifest(binding_path, workspace_root)
+
+
 def _load_state_root(
     environment: Mapping[str, str],
     workspace_root: Path,
@@ -83,7 +248,8 @@ def _load_state_root(
     value = environment.get("TOOLHUB_STATE_ROOT")
 
     if value is None:
-        candidate = user_state_path("mcp-toolhub", appauthor=False)
+        base = user_state_path("mcp-toolhub", appauthor=False)
+        candidate = base / "workspaces" / _workspace_identifier(workspace_root)
     else:
         if not value.strip():
             raise StateConfigurationError("Invalid TOOLHUB_STATE_ROOT: value is empty")
@@ -119,6 +285,8 @@ def _load_state_root(
         raise StateConfigurationError(
             f"Invalid TOOLHUB_STATE_ROOT: path is not a directory: {state_root}"
         )
+
+    _bind_state_namespace(state_root, workspace_root)
 
     return state_root
 

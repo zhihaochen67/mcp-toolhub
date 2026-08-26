@@ -26,6 +26,7 @@ from mcp_toolhub.security.executable_snapshot import (
 )
 from mcp_toolhub.security.paths import (
     RuntimeConfigurationError,
+    get_workspace_root,
     initialize_runtime_configuration,
 )
 
@@ -104,6 +105,7 @@ def _format_request(request: ApprovalRequest) -> str:
 
     lines = [
         request.request_id,
+        f"  workspace:    {_json_string(str(get_workspace_root()))}",
         f"  status:       {request.status.value}",
     ]
 

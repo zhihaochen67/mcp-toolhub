@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,9 @@ from mcp_toolhub.security.paths import (
     RuntimeConfigurationError,
     StateConfigurationError,
     WorkspaceConfigurationError,
+    _load_state_root,
     _reset_runtime_configuration_for_tests,
+    _workspace_identifier,
     get_state_root,
     get_workspace_root,
     initialize_runtime_configuration,
@@ -100,8 +105,172 @@ def test_default_state_root_uses_platform_directory(temp_dir, monkeypatch):
 
     configuration = initialize_runtime_configuration()
 
-    assert configuration.state_root == state_root.resolve()
-    assert state_root.is_dir()
+    workspace_id = _workspace_identifier(workspace.resolve())
+    expected = state_root / "workspaces" / workspace_id
+    assert configuration.state_root == expected.resolve()
+    assert workspace_id.isalnum()
+    assert len(workspace_id) == 64
+    assert workspace.name not in workspace_id
+
+    binding = json.loads(
+        (expected / "workspace-binding.json").read_text(encoding="utf-8")
+    )
+    assert binding == {
+        "schema_version": 1,
+        "canonical_workspace": str(workspace.resolve()),
+    }
+
+
+def test_default_state_namespaces_are_deterministic_and_workspace_isolated(
+    temp_dir, monkeypatch
+):
+    state_base = temp_dir / "platform-state"
+    workspace_a = temp_dir / "workspace-a"
+    workspace_b = temp_dir / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    monkeypatch.setattr(
+        "mcp_toolhub.security.paths.user_state_path",
+        lambda *_args, **_kwargs: state_base,
+    )
+    monkeypatch.delenv("TOOLHUB_STATE_ROOT", raising=False)
+
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace_a.resolve()))
+    _reset_runtime_configuration_for_tests()
+    state_a = get_state_root()
+
+    _reset_runtime_configuration_for_tests()
+    assert get_state_root() == state_a
+
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace_b.resolve()))
+    _reset_runtime_configuration_for_tests()
+    state_b = get_state_root()
+
+    assert state_a != state_b
+    assert state_a.parent == state_b.parent == (state_base / "workspaces").resolve()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path case semantics")
+def test_default_workspace_identifier_is_case_insensitive_on_windows(temp_dir):
+    canonical = temp_dir.resolve()
+    case_variant = Path(str(canonical).swapcase())
+
+    assert _workspace_identifier(case_variant) == _workspace_identifier(canonical)
+
+
+def test_explicit_state_root_binds_once_to_one_workspace(temp_dir, monkeypatch):
+    workspace_a = temp_dir / "workspace-a"
+    workspace_b = temp_dir / "workspace-b"
+    state_root = temp_dir / "explicit-state"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(state_root.resolve()))
+
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace_a.resolve()))
+    _reset_runtime_configuration_for_tests()
+    assert get_state_root() == state_root.resolve()
+
+    _reset_runtime_configuration_for_tests()
+    assert get_state_root() == state_root.resolve()
+
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace_b.resolve()))
+    _reset_runtime_configuration_for_tests()
+    with pytest.raises(StateConfigurationError, match="different ToolHub workspace"):
+        get_state_root()
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "not-json",
+        json.dumps({"schema_version": 1}),
+        json.dumps({"canonical_workspace": "C:/missing"}),
+        json.dumps({"schema_version": 99, "canonical_workspace": "C:/missing"}),
+    ],
+)
+def test_explicit_state_root_malformed_binding_fails_closed(
+    temp_dir, monkeypatch, binding
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "explicit-state"
+    workspace.mkdir()
+    state_root.mkdir()
+    (state_root / "workspace-binding.json").write_text(binding, encoding="utf-8")
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace.resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(state_root.resolve()))
+    _reset_runtime_configuration_for_tests()
+
+    with pytest.raises(StateConfigurationError, match="workspace binding"):
+        get_state_root()
+
+
+def test_concurrent_explicit_first_bind_allows_only_one_workspace(temp_dir):
+    workspace_a = temp_dir / "workspace-a"
+    workspace_b = temp_dir / "workspace-b"
+    state_root = temp_dir / "explicit-state"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    barrier = threading.Barrier(2)
+
+    def bind(workspace):
+        barrier.wait()
+        try:
+            return _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+        except StateConfigurationError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(bind, (workspace_a, workspace_b)))
+
+    assert sum(result is not None for result in results) == 1
+    binding = json.loads(
+        (state_root / "workspace-binding.json").read_text(encoding="utf-8")
+    )
+    assert binding["canonical_workspace"] in {
+        str(workspace_a.resolve()),
+        str(workspace_b.resolve()),
+    }
+
+
+def test_concurrent_same_workspace_first_bind_both_succeed(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "explicit-state"
+    workspace.mkdir()
+    barrier = threading.Barrier(2)
+
+    def bind():
+        barrier.wait()
+        return _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: bind(), range(2)))
+
+    assert results == [state_root.resolve(), state_root.resolve()]
+
+
+def test_explicit_state_symlink_resolving_inside_workspace_fails(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    nested_state = workspace / "state"
+    alias = temp_dir / "outside-looking-state"
+    workspace.mkdir()
+    nested_state.mkdir()
+    try:
+        os.symlink(nested_state, alias, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace.resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(alias.absolute()))
+    _reset_runtime_configuration_for_tests()
+
+    with pytest.raises(RuntimeConfigurationError, match="must be outside"):
+        get_state_root()
 
 
 @pytest.mark.parametrize("value", ["", "relative/state"])
