@@ -50,7 +50,6 @@ from toolhub.security.paths import (
 )
 from toolhub.security.risk import RiskLevel
 
-
 MAX_WRITE_BYTES = 256 * 1024  # 256 KB of UTF-8 text
 MAX_PATCH_CHARS = 256 * 1024
 
@@ -576,7 +575,7 @@ def _validate_write_input(
     root: Path,
 ) -> Path:
     if not isinstance(content, str):
-        raise ValueError("Content must be a string")
+        raise TypeError("Content must be a string")
 
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_WRITE_BYTES:
@@ -622,7 +621,7 @@ def write_file(
         _validate_write_input(
             path, content, expected_hash, create_parents, root
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, TypeError, ValueError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool="filesystem.write_file",
@@ -804,7 +803,7 @@ def _validate_patch_input(
     root: Path,
 ) -> Path:
     if not isinstance(patch, str):
-        raise ValueError("Patch must be a string")
+        raise TypeError("Patch must be a string")
 
     if len(patch) > MAX_PATCH_CHARS:
         raise ValueError(
@@ -850,7 +849,7 @@ def apply_patch(
 
     try:
         _validate_patch_input(path, patch, expected_hash, root)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, TypeError, ValueError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool="filesystem.apply_patch",

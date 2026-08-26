@@ -19,7 +19,6 @@ from toolhub.security.risk import (
     assess_shell_command,
 )
 
-
 MAX_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 20_000
 
@@ -170,7 +169,9 @@ def _execute_subprocess(
         )
 
         if isinstance(exc, FileNotFoundError):
-            raise ValueError(f"Executable not found: {program}") from exc
+            raise ValueError(  # noqa: TRY004 - preserve the public API contract
+                f"Executable not found: {program}"
+            ) from exc
 
         raise ValueError(f"Failed to start {program}: {exc}") from exc
 

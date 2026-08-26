@@ -57,7 +57,7 @@ def _contains_escape_path(args: list[str]) -> bool:
         if value == "..":
             return True
 
-        if value.startswith("../") or value.startswith("..\\"):
+        if value.startswith(("../", "..\\")):
             return True
 
         try:

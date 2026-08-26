@@ -112,7 +112,6 @@ def test_git_diff_path_traversal_rejected(git_repo):
 
 def test_git_tools_accept_no_arbitrary_arguments():
     import anyio
-
     from mcp.server import MCPServer
 
     from toolhub.tools.git import register_git_tools
@@ -263,6 +262,7 @@ def test_git_status_does_not_execute_repo_fsmonitor(git_repo):
         subprocess.run(
             ["git", "fsmonitor--daemon", "stop"],
             cwd=str(git_repo),
+            check=False,
             capture_output=True,
             text=True,
             timeout=30,

@@ -49,7 +49,6 @@ from pydantic import BaseModel
 from toolhub.observability import audit
 from toolhub.security.paths import get_workspace_root
 
-
 GIT_TIMEOUT_SECONDS = 20
 GIT_MAX_OUTPUT_CHARS = 20_000
 GIT_MAX_ERROR_CHARS = 500
@@ -249,8 +248,7 @@ def _parse_status(raw: str) -> tuple[str | None, list[GitStatusEntry]]:
 
         if line.startswith("## "):
             part = line[3:]
-            if part.startswith("No commits yet on "):
-                part = part[len("No commits yet on "):]
+            part = part.removeprefix("No commits yet on ")
             branch = part.split("...", 1)[0].split(" [", 1)[0].strip()
             continue
 
@@ -268,7 +266,7 @@ def _count_diff(raw: str) -> tuple[int | None, int | None, bool]:
     deletions = 0
 
     for line in raw.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
+        if line.startswith(("+++", "---")):
             continue
         if line.startswith("+"):
             additions += 1

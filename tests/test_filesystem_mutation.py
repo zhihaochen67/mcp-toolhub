@@ -107,7 +107,7 @@ def test_write_file_create_requires_approval_and_creates(temp_dir):
 
     assert done.executed is True
     assert done.created is True
-    assert done.bytes_written == len("hello world".encode("utf-8"))
+    assert done.bytes_written == len(b"hello world")
     assert done.previous_hash is None
     assert done.new_hash == _sha("hello world")
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "hello world"
@@ -132,7 +132,7 @@ def test_write_file_create_parents_false_rejects_missing_parent(temp_dir):
 
 
 def test_write_file_create_parents_true_works(temp_dir):
-    result, done = _write_flow(
+    _result, done = _write_flow(
         temp_dir, "sub/dir/a.txt", "deep", create_parents=True
     )
 
@@ -195,7 +195,7 @@ def test_write_file_real_symlink_escape_rejected(temp_dir):
 def test_write_file_expected_hash_match_succeeds(temp_dir):
     _put(temp_dir, "a.txt", "current")
 
-    result, done = _write_flow(
+    _result, done = _write_flow(
         temp_dir, "a.txt", "updated", expected_hash=_sha("current")
     )
 
@@ -344,7 +344,7 @@ def test_apply_patch_expected_hash_match_succeeds(temp_dir):
     _put(temp_dir, "a.txt", "one\ntwo\n")
     patch = _make_patch("a.txt", "one\ntwo\n", "one\nTWO\n")
 
-    result, done = _patch_flow(
+    _result, done = _patch_flow(
         temp_dir, "a.txt", patch, expected_hash=_sha("one\ntwo\n")
     )
 
@@ -364,11 +364,11 @@ def test_apply_patch_stale_expected_hash_conflict(temp_dir):
 
 def test_apply_patch_append_and_prepend(temp_dir):
     _put(temp_dir, "a.txt", "a\nb\n")
-    result, _ = _patch_flow(temp_dir, "a.txt", _make_patch("a.txt", "a\nb\n", "a\nb\nc\n"))
+    _result, _ = _patch_flow(temp_dir, "a.txt", _make_patch("a.txt", "a\nb\n", "a\nb\nc\n"))
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "a\nb\nc\n"
 
     _put(temp_dir, "b.txt", "a\nb\n")
-    result2, _ = _patch_flow(temp_dir, "b.txt", _make_patch("b.txt", "a\nb\n", "z\na\nb\n"))
+    _result2, _ = _patch_flow(temp_dir, "b.txt", _make_patch("b.txt", "a\nb\n", "z\na\nb\n"))
     assert (temp_dir / "b.txt").read_text(encoding="utf-8") == "z\na\nb\n"
 
 
@@ -502,7 +502,6 @@ def test_expired_approval_blocks_execution(temp_dir, monkeypatch):
 
 def test_filesystem_tool_schemas():
     import anyio
-
     from mcp.server import MCPServer
 
     from toolhub.tools.filesystem import register_filesystem_tools

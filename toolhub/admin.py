@@ -61,7 +61,7 @@ def _format_request(request: ApprovalRequest) -> str:
 
     if request.kind == "shell":
         args = " ".join(request.args) if request.args else ""
-        lines.append(f"  kind:         shell")
+        lines.append("  kind:         shell")
         lines.append(f"  command:      {request.program} {args}".rstrip())
         lines.append(f"  cwd:          {request.cwd}")
     else:

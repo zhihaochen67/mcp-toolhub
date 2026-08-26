@@ -26,13 +26,13 @@ import json
 import os
 import secrets
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from toolhub.security.paths import STATE_ROOT
 from toolhub.security.risk import RiskLevel
@@ -87,7 +87,7 @@ LOCK_STALE_SECONDS = 15.0
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _default_store_path() -> Path:
@@ -141,8 +141,7 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
     for request_id, data in payload.items():
         try:
             requests[request_id] = ApprovalRequest.model_validate(data)
-        except Exception:
-            # Skip malformed entries rather than failing the whole store.
+        except ValidationError:
             continue
 
     return requests

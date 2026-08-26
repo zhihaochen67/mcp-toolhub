@@ -15,13 +15,13 @@ from toolhub.tools.shell import run_approved_shell, run_shell
 
 
 def _create_request(**kwargs):
-    defaults = dict(
-        program="python",
-        args=["--version"],
-        cwd=".",
-        risk=RiskLevel.MEDIUM,
-        risk_reason="test",
-    )
+    defaults = {
+        "program": "python",
+        "args": ["--version"],
+        "cwd": ".",
+        "risk": RiskLevel.MEDIUM,
+        "risk_reason": "test",
+    }
     defaults.update(kwargs)
     return approval.create_request(**defaults)
 

@@ -24,12 +24,11 @@ import os
 import re
 import secrets
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from toolhub.security.paths import STATE_ROOT
-
 
 DEFAULT_AUDIT_PATH = STATE_ROOT / "audit.jsonl"
 
@@ -61,7 +60,7 @@ def new_trace_id() -> str:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _default_audit_path() -> Path:
@@ -253,14 +252,13 @@ def record_event(
 
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-        with _write_lock:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.flush()
+        with _write_lock, open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
 
         return True
 
-    except Exception:
+    except Exception:  # noqa: BLE001 - audit is a non-fatal boundary
         # Defensive: audit must never break tool execution.
         return False
 

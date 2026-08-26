@@ -21,13 +21,13 @@ def _last_event():
 
 
 def _create_request(**kwargs):
-    defaults = dict(
-        program="python",
-        args=["--version"],
-        cwd=".",
-        risk=RiskLevel.MEDIUM,
-        risk_reason="test",
-    )
+    defaults = {
+        "program": "python",
+        "args": ["--version"],
+        "cwd": ".",
+        "risk": RiskLevel.MEDIUM,
+        "risk_reason": "test",
+    }
     defaults.update(kwargs)
     return approval.create_request(**defaults)
 
@@ -237,7 +237,6 @@ def test_read_recent_empty_when_no_events():
 
 def test_audit_recent_tool_schema_and_reads():
     import anyio
-
     from mcp.server import MCPServer
 
     from toolhub.tools.audit import register_audit_tools
