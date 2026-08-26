@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from toolhub.security.command_policy import assess_shell_command
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.command_policy import assess_shell_command
+from mcp_toolhub.security.risk import RiskLevel
 
 
 def _executable_name(stem: str) -> str:
@@ -184,7 +184,7 @@ def test_unavailable_runtime_fails_closed_to_medium(temp_dir, monkeypatch):
     workspace = (temp_dir / "workspace").resolve()
     workspace.mkdir()
     monkeypatch.setattr(
-        "toolhub.security.command_policy.sys.executable",
+        "mcp_toolhub.security.command_policy.sys.executable",
         str(temp_dir / "missing-python"),
     )
 

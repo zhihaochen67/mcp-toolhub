@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from toolhub import admin
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalStatus
-from toolhub.security.executable_snapshot import fingerprint_executable
-from toolhub.security.paths import get_workspace_root
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub import admin
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalStatus
+from mcp_toolhub.security.executable_snapshot import fingerprint_executable
+from mcp_toolhub.security.paths import get_workspace_root
+from mcp_toolhub.security.risk import RiskLevel
 
 _DEFAULT_SNAPSHOT = object()
 
@@ -61,10 +61,11 @@ def test_shell_identity_is_shown_unambiguously_before_approval(
     def confirm(prompt):
         displayed = capsys.readouterr().out
         assert "Approval candidate:" in displayed
+        assert json.dumps(str(get_workspace_root()), ensure_ascii=True) in displayed
         assert json.dumps(request.program, ensure_ascii=True) in displayed
         assert json.dumps(str(executable.resolve()), ensure_ascii=True) in displayed
         assert snapshot["sha256"] in displayed
-        assert f'{snapshot["size"]} bytes' in displayed
+        assert f"{snapshot['size']} bytes" in displayed
         assert 'cwd:                  "."' in displayed
         assert f"argument_count:       {len(arguments)}" in displayed
         for index, argument in enumerate(arguments):

@@ -12,11 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from toolhub.observability import audit
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalStatus
-from toolhub.security.risk import RiskLevel
-from toolhub.tools.filesystem import (
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalStatus
+from mcp_toolhub.security.paths import get_state_root
+from mcp_toolhub.security.risk import RiskLevel
+from mcp_toolhub.tools.filesystem import (
     MAX_PATCH_CHARS,
     MAX_WRITE_BYTES,
     MutationConflictError,
@@ -59,9 +60,7 @@ def _last_event():
 
 
 def _write_flow(root, path, content, expected_hash=None, create_parents=False):
-    result = write_file(
-        path, content, expected_hash, create_parents, root=root
-    )
+    result = write_file(path, content, expected_hash, create_parents, root=root)
     approval.approve_request(result.request_id)
     return result, write_file_approved(result.request_id, root=root)
 
@@ -133,15 +132,11 @@ def test_write_file_create_parents_false_rejects_missing_parent(temp_dir):
 
 
 def test_write_file_create_parents_true_works(temp_dir):
-    _result, done = _write_flow(
-        temp_dir, "sub/dir/a.txt", "deep", create_parents=True
-    )
+    _result, done = _write_flow(temp_dir, "sub/dir/a.txt", "deep", create_parents=True)
 
     assert done.executed is True
     assert done.path == "sub/dir/a.txt"
-    assert (temp_dir / "sub" / "dir" / "a.txt").read_text(
-        encoding="utf-8"
-    ) == "deep"
+    assert (temp_dir / "sub" / "dir" / "a.txt").read_text(encoding="utf-8") == "deep"
 
 
 def test_write_file_traversal_rejected(temp_dir):
@@ -245,9 +240,7 @@ def test_write_failure_leaves_file_unchanged(temp_dir, monkeypatch):
     def boom(*args, **kwargs):
         raise OSError("simulated write failure")
 
-    monkeypatch.setattr(
-        "toolhub.tools.filesystem.open", boom, raising=False
-    )
+    monkeypatch.setattr("mcp_toolhub.tools.filesystem.open", boom, raising=False)
 
     with pytest.raises(OSError):
         write_file_approved(result.request_id, root=temp_dir)
@@ -309,13 +302,7 @@ def test_apply_patch_redirect_to_other_file_rejected(temp_dir):
 
 def test_apply_patch_escape_redirect_rejected(temp_dir):
     _put(temp_dir, "a.txt", "a\n")
-    patch = (
-        "--- ../outside.txt\n"
-        "+++ ../outside.txt\n"
-        "@@ -1,1 +1,1 @@\n"
-        "-a\n"
-        "+b\n"
-    )
+    patch = "--- ../outside.txt\n+++ ../outside.txt\n@@ -1,1 +1,1 @@\n-a\n+b\n"
 
     with pytest.raises(ValueError, match="does not match target"):
         apply_patch("a.txt", patch, root=temp_dir)
@@ -365,11 +352,15 @@ def test_apply_patch_stale_expected_hash_conflict(temp_dir):
 
 def test_apply_patch_append_and_prepend(temp_dir):
     _put(temp_dir, "a.txt", "a\nb\n")
-    _result, _ = _patch_flow(temp_dir, "a.txt", _make_patch("a.txt", "a\nb\n", "a\nb\nc\n"))
+    _result, _ = _patch_flow(
+        temp_dir, "a.txt", _make_patch("a.txt", "a\nb\n", "a\nb\nc\n")
+    )
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "a\nb\nc\n"
 
     _put(temp_dir, "b.txt", "a\nb\n")
-    _result2, _ = _patch_flow(temp_dir, "b.txt", _make_patch("b.txt", "a\nb\n", "z\na\nb\n"))
+    _result2, _ = _patch_flow(
+        temp_dir, "b.txt", _make_patch("b.txt", "a\nb\n", "z\na\nb\n")
+    )
     assert (temp_dir / "b.txt").read_text(encoding="utf-8") == "z\na\nb\n"
 
 
@@ -534,7 +525,7 @@ def test_expired_approval_blocks_execution(temp_dir, monkeypatch):
 
     request = approval.get_request(result.request_id)
     future = request.expires_at + timedelta(seconds=5)
-    monkeypatch.setattr("toolhub.security.approval._now", lambda: future)
+    monkeypatch.setattr("mcp_toolhub.security.approval._now", lambda: future)
 
     done = write_file_approved(result.request_id, root=temp_dir)
 
@@ -547,7 +538,7 @@ def test_filesystem_tool_schemas():
     import anyio
     from mcp.server import MCPServer
 
-    from toolhub.tools.filesystem import register_filesystem_tools
+    from mcp_toolhub.tools.filesystem import register_filesystem_tools
 
     srv = MCPServer("test")
     register_filesystem_tools(srv)
@@ -562,14 +553,10 @@ def test_filesystem_tool_schemas():
             tools["filesystem.apply_patch"].input_schema.get("properties", {})
         ) == {"path", "patch", "expected_hash"}
         assert set(
-            tools["filesystem.write_file_approved"].input_schema.get(
-                "properties", {}
-            )
+            tools["filesystem.write_file_approved"].input_schema.get("properties", {})
         ) == {"request_id"}
         assert set(
-            tools["filesystem.apply_patch_approved"].input_schema.get(
-                "properties", {}
-            )
+            tools["filesystem.apply_patch_approved"].input_schema.get("properties", {})
         ) == {"request_id"}
 
         assert tools["filesystem.read_file"].annotations.read_only_hint is True
@@ -634,7 +621,7 @@ def test_audit_log_contains_no_content_or_patch(temp_dir):
     patch = _make_patch("b.txt", "x\ny\n", f"x\n{patch_sentinel}\ny\n")
     _patch_flow(temp_dir, "b.txt", patch)
 
-    raw = Path(os.environ["TOOLHUB_AUDIT_PATH"]).read_text(encoding="utf-8")
+    raw = (get_state_root() / "audit.jsonl").read_text(encoding="utf-8")
     assert sentinel not in raw
     assert patch_sentinel not in raw
 

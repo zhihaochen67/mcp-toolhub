@@ -1,8 +1,8 @@
 """Shared test fixtures.
 
-Every test runs against an isolated approval store and audit log so that the
-real ``.toolhub/approvals.json`` / ``.toolhub/audit.jsonl`` are never touched
-and tests do not interfere with each other.
+Every test runs against isolated workspace and state roots so the real
+per-user approval store and audit log are never touched and tests do not
+interfere with each other.
 
 Note: this file deliberately avoids pytest's ``tmp_path``/``tmp_path_factory``
 fixtures. Under the DSH Windows file sandbox those fixtures create their
@@ -49,22 +49,25 @@ def _new_temp_dir(prefix: str) -> Path:
 
 @pytest.fixture(autouse=True)
 def isolated_approval_store(monkeypatch):
-    from toolhub.security.paths import _reset_workspace_configuration_for_tests
+    from mcp_toolhub.security.paths import _reset_runtime_configuration_for_tests
 
-    store_dir = _new_temp_dir("approvals")
-    store = store_dir / "approvals.json"
-    audit_log = store_dir / "audit.jsonl"
+    runtime_dir = _new_temp_dir("runtime")
+    workspace = runtime_dir / "workspace"
+    state_root = runtime_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
 
-    monkeypatch.setenv("TOOLHUB_APPROVAL_STORE", str(store))
+    monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(workspace.resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(state_root.resolve()))
     monkeypatch.setenv("TOOLHUB_APPROVAL_TTL_SECONDS", "300")
-    monkeypatch.setenv("TOOLHUB_AUDIT_PATH", str(audit_log))
-    monkeypatch.delenv("TOOLHUB_WORKSPACE_ROOT", raising=False)
-    _reset_workspace_configuration_for_tests()
+    monkeypatch.delenv("TOOLHUB_APPROVAL_STORE", raising=False)
+    monkeypatch.delenv("TOOLHUB_AUDIT_PATH", raising=False)
+    _reset_runtime_configuration_for_tests()
 
-    yield store
+    yield state_root / "approvals.json"
 
-    _reset_workspace_configuration_for_tests()
-    _rmtree(store_dir)
+    _reset_runtime_configuration_for_tests()
+    _rmtree(runtime_dir)
 
 
 @pytest.fixture

@@ -21,8 +21,8 @@ def assess_shell_command(program: str, args: list[str]) -> RiskAssessment:
     as an intrinsic ToolHub capability. Callers needing only a risk assessment
     keep this legacy API without retaining the old basename-only behavior.
     """
-    from toolhub.security.command_policy import assess_shell_command as assess
-    from toolhub.security.paths import get_workspace_root
+    from mcp_toolhub.security.command_policy import assess_shell_command as assess
+    from mcp_toolhub.security.paths import get_workspace_root
 
     workspace = get_workspace_root()
     decision = assess(

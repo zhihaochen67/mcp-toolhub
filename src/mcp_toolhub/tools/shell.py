@@ -6,24 +6,24 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from toolhub.observability import audit
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalStatus
-from toolhub.security.command_policy import (
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalStatus
+from mcp_toolhub.security.command_policy import (
     CommandPolicyDecision,
     assess_shell_command,
 )
-from toolhub.security.executable_snapshot import (
+from mcp_toolhub.security.executable_snapshot import (
     resolve_executable_snapshot,
     validate_executable_snapshot,
 )
-from toolhub.security.paths import (
+from mcp_toolhub.security.paths import (
     get_workspace_root,
     relative_workspace_path,
     resolve_workspace_path,
     validate_workspace_snapshot,
 )
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.risk import RiskLevel
 
 MAX_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 20_000
@@ -63,10 +63,7 @@ def _truncate_output(value: str) -> str:
 
     remaining = len(value) - MAX_OUTPUT_CHARS
 
-    return (
-        value[:MAX_OUTPUT_CHARS]
-        + f"\n\n[ToolHub truncated {remaining} characters]"
-    )
+    return value[:MAX_OUTPUT_CHARS] + f"\n\n[ToolHub truncated {remaining} characters]"
 
 
 def _to_text(value: str | bytes | None) -> str:
@@ -108,9 +105,7 @@ def _execute_subprocess(
     relative_cwd = relative_workspace_path(working_directory)
     arguments = {"program": program, "args": args}
     audit_extra = (
-        {"command_policy": policy_metadata}
-        if policy_metadata is not None
-        else None
+        {"command_policy": policy_metadata} if policy_metadata is not None else None
     )
     started = time.monotonic()
 
@@ -458,7 +453,16 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
     started = time.monotonic()
     policy_metadata: dict[str, object] | None = None
 
-    def audit_rejection(*, status, error, error_type="ApprovalStateError", program="", args=None, cwd=".", risk=None):
+    def audit_rejection(
+        *,
+        status,
+        error,
+        error_type="ApprovalStateError",
+        program="",
+        args=None,
+        cwd=".",
+        risk=None,
+    ):
         audit.record_event(
             trace_id=trace_id,
             tool="shell.run_approved",

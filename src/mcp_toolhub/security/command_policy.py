@@ -19,8 +19,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from toolhub.security.paths import get_workspace_root
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.paths import get_workspace_root
+from mcp_toolhub.security.risk import RiskLevel
 
 _WINDOWS = os.name == "nt"
 
@@ -52,9 +52,7 @@ DESTRUCTIVE_PROGRAMS = frozenset(
     }
 )
 
-PYTHON_NAMES = frozenset(
-    {"python", "python.exe", "python3", "python3.exe"}
-)
+PYTHON_NAMES = frozenset({"python", "python.exe", "python3", "python3.exe"})
 PYTHON_LAUNCHER_NAMES = frozenset({"py", "py.exe"})
 PYTEST_NAMES = frozenset({"pytest", "pytest.exe"})
 GIT_NAMES = frozenset({"git", "git.exe"})
@@ -64,8 +62,7 @@ WINDOWS_SCRIPT_EXTENSIONS = frozenset({".bat", ".cmd"})
 # already-running ToolHub runtime. The Windows py launcher is intentionally
 # absent because it performs another interpreter selection.
 PYTHON_RUNTIME_ALIASES = frozenset(
-    {"python", "python3"}
-    | ({"python.exe", "python3.exe"} if _WINDOWS else set())
+    {"python", "python3"} | ({"python.exe", "python3.exe"} if _WINDOWS else set())
 )
 
 
@@ -120,9 +117,7 @@ class ExecutableIdentity:
             metadata["scope"] = "unresolved"
         else:
             try:
-                workspace_path = self.resolved_path.relative_to(
-                    get_workspace_root()
-                )
+                workspace_path = self.resolved_path.relative_to(get_workspace_root())
             except ValueError:
                 metadata["scope"] = "external"
             else:

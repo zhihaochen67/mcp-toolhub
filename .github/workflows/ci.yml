@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --python "${{ matrix.python-version }}"
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Compile package
+        run: uv run python -m compileall -q src/mcp_toolhub
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Build packages
+        run: uv build
+
+      - name: Inspect and smoke-test installed wheel
+        run: >-
+          uv run python scripts/artifact_smoke.py
+          --dist-dir dist
+          --venv "${{ runner.temp }}/mcp-toolhub-wheel-env"
+          --repository "${{ github.workspace }}"

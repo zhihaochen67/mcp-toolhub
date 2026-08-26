@@ -10,16 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from toolhub.observability import audit
-from toolhub.security import approval
-from toolhub.security.executable_snapshot import resolve_executable_snapshot
-from toolhub.security.paths import (
-    _reset_workspace_configuration_for_tests,
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
+from mcp_toolhub.security.paths import (
+    _reset_runtime_configuration_for_tests,
+    get_state_root,
     get_workspace_root,
     resolve_workspace_path,
 )
-from toolhub.security.risk import RiskLevel
-from toolhub.tools.shell import run_approved_shell, run_shell
+from mcp_toolhub.security.risk import RiskLevel
+from mcp_toolhub.tools.shell import run_approved_shell, run_shell
 
 
 def _last_event():
@@ -110,7 +111,7 @@ def test_approved_execution_keeps_policy_audit_correlation(monkeypatch):
     def fake_run(command, **kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="clean\n", stderr="")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
@@ -156,7 +157,7 @@ def test_external_executable_directory_is_not_exposed_in_policy_audit(
 
 def test_workspace_executable_audit_uses_relative_path(temp_dir, monkeypatch):
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(temp_dir))
-    _reset_workspace_configuration_for_tests()
+    _reset_runtime_configuration_for_tests()
     executable = _make_audit_executable(temp_dir / "tools", "workspace-audit")
     relative_program = str(executable.relative_to(temp_dir))
 
@@ -255,7 +256,7 @@ def test_timeout_audited(monkeypatch):
     def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     request = _create_request(program="pytest", args=["-q"])
     approval.approve_request(request.request_id)
@@ -274,7 +275,7 @@ def test_execution_failure_audited(monkeypatch):
     def fake_run(cmd, **kwargs):
         raise FileNotFoundError("no such executable")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     request = _create_request(program="pytest", args=["-q"])
     approval.approve_request(request.request_id)
@@ -304,18 +305,24 @@ def test_audit_redacts_sensitive_args():
         "--version",
     ]
 
-    raw = Path(os.environ["TOOLHUB_AUDIT_PATH"]).read_text(encoding="utf-8")
+    raw = (get_state_root() / "audit.jsonl").read_text(encoding="utf-8")
     assert "hunter2" not in raw
     assert "abc123" not in raw
 
 
-def test_audit_failure_does_not_break_execution(monkeypatch, isolated_approval_store):
+def test_audit_failure_does_not_break_execution(isolated_approval_store):
     blocker = isolated_approval_store.parent / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
-    monkeypatch.setenv("TOOLHUB_AUDIT_PATH", str(blocker / "audit.jsonl"))
 
     # The write path itself fails defensively...
-    assert audit.record_event(tool="test", action="x") is False
+    assert (
+        audit.record_event(
+            tool="test",
+            action="x",
+            audit_path=blocker / "audit.jsonl",
+        )
+        is False
+    )
 
     # ...and tool execution is unaffected.
     result = run_shell("python", ["--version"])
@@ -360,7 +367,7 @@ def test_audit_recent_tool_schema_and_reads():
     import anyio
     from mcp.server import MCPServer
 
-    from toolhub.tools.audit import register_audit_tools
+    from mcp_toolhub.tools.audit import register_audit_tools
 
     run_shell("python", ["--version"])
 

@@ -13,16 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalStatus
-from toolhub.security.executable_snapshot import resolve_executable_snapshot
-from toolhub.security.paths import (
-    _reset_workspace_configuration_for_tests,
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalStatus
+from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
+from mcp_toolhub.security.paths import (
+    _reset_runtime_configuration_for_tests,
     get_workspace_root,
     resolve_workspace_path,
 )
-from toolhub.security.risk import RiskLevel
-from toolhub.tools.shell import run_approved_shell, run_shell
+from mcp_toolhub.security.risk import RiskLevel
+from mcp_toolhub.tools.shell import run_approved_shell, run_shell
 
 
 def _create_request(**kwargs):
@@ -98,11 +98,9 @@ def test_low_execution_does_not_start_a_subprocess(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="Python 3.13.11\n", stderr=""
-        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="Python 3.13.11\n", stderr="")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     result = run_shell("python", ["--version"])
 
@@ -201,7 +199,7 @@ def test_expired_approval_cannot_run(monkeypatch):
     approval.approve_request(request.request_id)
 
     future = request.expires_at + timedelta(seconds=5)
-    monkeypatch.setattr("toolhub.security.approval._now", lambda: future)
+    monkeypatch.setattr("mcp_toolhub.security.approval._now", lambda: future)
 
     result = run_approved_shell(request.request_id)
 
@@ -217,11 +215,9 @@ def test_request_id_cannot_alter_command(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="Python 3.13.11\n", stderr=""
-        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="Python 3.13.11\n", stderr="")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     result = run_approved_shell(request.request_id)
 
@@ -257,7 +253,7 @@ def test_path_change_after_approval_does_not_change_executable(
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="first\n", stderr="")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
@@ -270,7 +266,7 @@ def test_workspace_local_executable_runs_approved_identity(
     monkeypatch,
 ):
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(temp_dir))
-    _reset_workspace_configuration_for_tests()
+    _reset_runtime_configuration_for_tests()
     executable = _make_executable(temp_dir, "workspace-tool", "approved")
     created = run_shell(str(executable), ["--probe"])
     approval.approve_request(created.request_id)
@@ -281,7 +277,7 @@ def test_workspace_local_executable_runs_approved_identity(
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
@@ -300,7 +296,7 @@ def test_executable_replacement_after_approval_fails_closed(
 
     calls = []
     monkeypatch.setattr(
-        "toolhub.tools.shell.subprocess.run",
+        "mcp_toolhub.tools.shell.subprocess.run",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
@@ -423,7 +419,7 @@ def test_concurrent_replay_allows_at_most_one_execution(monkeypatch):
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
     monkeypatch.setattr(approval, "consume_request", synchronized_consume)
-    monkeypatch.setattr("toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(
@@ -440,7 +436,7 @@ def test_executable_validation_is_the_final_identity_step(monkeypatch):
     approval.approve_request(request.request_id)
     order = []
 
-    from toolhub.tools import shell as shell_module
+    from mcp_toolhub.tools import shell as shell_module
 
     original_validate = shell_module.validate_executable_snapshot
 

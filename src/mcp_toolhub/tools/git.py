@@ -46,8 +46,8 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from toolhub.observability import audit
-from toolhub.security.paths import get_workspace_root
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security.paths import get_workspace_root
 
 GIT_TIMEOUT_SECONDS = 20
 GIT_MAX_OUTPUT_CHARS = 20_000
@@ -158,7 +158,14 @@ def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
-def _audit_failure(trace_id: str, tool: str, arguments: dict, error: str, error_type: str, duration_ms: int) -> None:
+def _audit_failure(
+    trace_id: str,
+    tool: str,
+    arguments: dict,
+    error: str,
+    error_type: str,
+    duration_ms: int,
+) -> None:
     audit.record_event(
         trace_id=trace_id,
         tool=tool,
@@ -209,9 +216,7 @@ def _discover_worktree_root(root: Path) -> Path:
 
     top_level = completed.stdout.strip()
     if not top_level:
-        raise GitCommandError(
-            "git rev-parse --show-toplevel produced no output"
-        )
+        raise GitCommandError("git rev-parse --show-toplevel produced no output")
 
     return Path(top_level).resolve()
 
@@ -296,19 +301,25 @@ def git_status(root: Path | None = None) -> GitStatusResult:
         )
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
-            trace_id, "git.status", arguments, str(exc),
-            _audit_error_type(exc), _elapsed_ms(started),
+            trace_id,
+            "git.status",
+            arguments,
+            str(exc),
+            _audit_error_type(exc),
+            _elapsed_ms(started),
         )
         raise
 
     try:
-        completed = _run_git(
-            worktree_root, ["status", "--porcelain=v1", "--branch"]
-        )
+        completed = _run_git(worktree_root, ["status", "--porcelain=v1", "--branch"])
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
-            trace_id, "git.status", arguments, str(exc),
-            _audit_error_type(exc), _elapsed_ms(started),
+            trace_id,
+            "git.status",
+            arguments,
+            str(exc),
+            _audit_error_type(exc),
+            _elapsed_ms(started),
         )
         raise
 
@@ -317,8 +328,12 @@ def git_status(root: Path | None = None) -> GitStatusResult:
     if completed.returncode != 0:
         error = _git_error(completed)
         _audit_failure(
-            trace_id, "git.status", arguments, str(error),
-            _audit_error_type(error), duration_ms,
+            trace_id,
+            "git.status",
+            arguments,
+            str(error),
+            _audit_error_type(error),
+            duration_ms,
         )
         raise error
 
@@ -383,8 +398,12 @@ def git_diff(
 
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
-            trace_id, "git.diff", arguments, str(exc),
-            _audit_error_type(exc), _elapsed_ms(started),
+            trace_id,
+            "git.diff",
+            arguments,
+            str(exc),
+            _audit_error_type(exc),
+            _elapsed_ms(started),
         )
         raise
 
@@ -392,8 +411,12 @@ def git_diff(
         completed = _run_git(worktree_root, argv)
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
-            trace_id, "git.diff", arguments, str(exc),
-            _audit_error_type(exc), _elapsed_ms(started),
+            trace_id,
+            "git.diff",
+            arguments,
+            str(exc),
+            _audit_error_type(exc),
+            _elapsed_ms(started),
         )
         raise
 
@@ -402,8 +425,12 @@ def git_diff(
     if completed.returncode != 0:
         error = _git_error(completed)
         _audit_failure(
-            trace_id, "git.diff", arguments, str(error),
-            _audit_error_type(error), duration_ms,
+            trace_id,
+            "git.diff",
+            arguments,
+            str(error),
+            _audit_error_type(error),
+            duration_ms,
         )
         raise error
 

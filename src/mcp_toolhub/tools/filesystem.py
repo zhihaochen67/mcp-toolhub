@@ -40,16 +40,16 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from toolhub.observability import audit
-from toolhub.security import approval
-from toolhub.security.approval import ApprovalRequest, ApprovalStatus
-from toolhub.security.paths import (
+from mcp_toolhub.observability import audit
+from mcp_toolhub.security import approval
+from mcp_toolhub.security.approval import ApprovalRequest, ApprovalStatus
+from mcp_toolhub.security.paths import (
     MAX_FILE_SIZE,
     get_workspace_root,
     resolve_path_within,
     validate_workspace_snapshot,
 )
-from toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.risk import RiskLevel
 
 MAX_WRITE_BYTES = 256 * 1024  # 256 KB of UTF-8 text
 MAX_PATCH_CHARS = 256 * 1024
@@ -226,9 +226,7 @@ def _atomic_write_text(target: Path, text: str) -> None:
 # Unified-diff parsing / application (strict, single-file, in-process)
 # --------------------------------------------------------------------------
 
-_HUNK_HEADER_RE = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
-)
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 @dataclass(frozen=True)
@@ -252,7 +250,7 @@ def _strip_eol(line: str) -> str:
 
 
 def _patch_header_name(line: str, marker: str) -> str:
-    rest = _strip_eol(line[len(marker):])
+    rest = _strip_eol(line[len(marker) :])
     return rest.split("\t", 1)[0]
 
 
@@ -260,7 +258,7 @@ def _normalize_patch_name(name: str) -> str:
     name = name.replace("\\", "/")
     for prefix in ("a/", "b/"):
         if name.startswith(prefix):
-            return name[len(prefix):]
+            return name[len(prefix) :]
     return name
 
 
@@ -342,8 +340,7 @@ def parse_unified_patch(patch: str, target: str) -> list[_PatchHunk]:
             elif line.startswith("\\"):
                 if last_kind is None:
                     raise ValueError(
-                        "Malformed patch: 'no newline' marker without "
-                        "a preceding line"
+                        "Malformed patch: 'no newline' marker without a preceding line"
                     )
                 if last_kind in (" ", "-") and old_lines:
                     old_lines[-1] = _strip_eol(old_lines[-1])
@@ -368,13 +365,9 @@ def parse_unified_patch(patch: str, target: str) -> list[_PatchHunk]:
                 f"but has {len(new_lines)}"
             )
         if old_count == 0 and old_lines:
-            raise ValueError(
-                "Malformed patch: zero-count hunk contains old lines"
-            )
+            raise ValueError("Malformed patch: zero-count hunk contains old lines")
         if new_count == 0 and new_lines:
-            raise ValueError(
-                "Malformed patch: zero-count hunk contains new lines"
-            )
+            raise ValueError("Malformed patch: zero-count hunk contains new lines")
 
         hunks.append(
             _PatchHunk(
@@ -426,14 +419,11 @@ def apply_patch_text(original: str, patch: str, target: str) -> tuple[str, int, 
                 raise ValueError("Patch hunk position is out of range")
             if lines[start:end] != hunk.old_lines:
                 raise ValueError(
-                    "Patch does not match the file content "
-                    "(stale or wrong file?)"
+                    "Patch does not match the file content (stale or wrong file?)"
                 )
 
         lines = (
-            lines[:start]
-            + list(hunk.new_lines)
-            + lines[start + len(hunk.old_lines):]
+            lines[:start] + list(hunk.new_lines) + lines[start + len(hunk.old_lines) :]
         )
 
         offset += len(hunk.new_lines) - len(hunk.old_lines)
@@ -470,9 +460,11 @@ def _load_and_consume(
 
     if consumed is None:
         current = approval.get_request(request_id)
-        return None, (
-            current.status if current is not None else ApprovalStatus.EXPIRED
-        ), False
+        return (
+            None,
+            (current.status if current is not None else ApprovalStatus.EXPIRED),
+            False,
+        )
 
     return consumed, consumed.status, True
 
@@ -488,8 +480,7 @@ def _payload_trace_id(request: ApprovalRequest | None) -> str | None:
 def _validate_payload(request: ApprovalRequest, kind: str, required: set[str]) -> dict:
     if request.kind != kind:
         raise ValueError(
-            f"Approval request kind mismatch: expected {kind!r}, "
-            f"got {request.kind!r}"
+            f"Approval request kind mismatch: expected {kind!r}, got {request.kind!r}"
         )
 
     payload = dict(request.payload or {})
@@ -523,8 +514,7 @@ def read_file(path: str, root: Path | None = None) -> ReadFileResult:
 
     if size > MAX_FILE_SIZE:
         raise ValueError(
-            f"File too large: {size} bytes "
-            f"(maximum {MAX_FILE_SIZE} bytes)"
+            f"File too large: {size} bytes (maximum {MAX_FILE_SIZE} bytes)"
         )
 
     content = target.read_text(encoding="utf-8")
@@ -555,8 +545,7 @@ def _validate_write_input(
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_WRITE_BYTES:
         raise ValueError(
-            f"Content too large: {len(encoded)} bytes "
-            f"(maximum {MAX_WRITE_BYTES})"
+            f"Content too large: {len(encoded)} bytes (maximum {MAX_WRITE_BYTES})"
         )
 
     target = _resolve_mutation_target(root, path)
@@ -593,9 +582,7 @@ def write_file(
     }
 
     try:
-        _validate_write_input(
-            path, content, expected_hash, create_parents, root
-        )
+        _validate_write_input(path, content, expected_hash, create_parents, root)
     except (FileNotFoundError, TypeError, ValueError) as exc:
         audit.record_event(
             trace_id=trace_id,
@@ -667,9 +654,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
 
     if not consumed_ok:
         path = (
-            str((request.payload or {}).get("path", ""))
-            if request is not None
-            else ""
+            str((request.payload or {}).get("path", "")) if request is not None else ""
         )
         status_value = status.value if status else "unknown"
         audit.record_event(
@@ -696,7 +681,9 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
 
     try:
         payload = _validate_payload(
-            request, "file_write", {"path", "content", "expected_hash", "create_parents"}
+            request,
+            "file_write",
+            {"path", "content", "expected_hash", "create_parents"},
         )
         validate_workspace_snapshot(payload, root)
         path = str(payload["path"])
@@ -782,8 +769,7 @@ def _validate_patch_input(
 
     if len(patch) > MAX_PATCH_CHARS:
         raise ValueError(
-            f"Patch too large: {len(patch)} characters "
-            f"(maximum {MAX_PATCH_CHARS})"
+            f"Patch too large: {len(patch)} characters (maximum {MAX_PATCH_CHARS})"
         )
 
     target = _resolve_mutation_target(root, path)
@@ -894,9 +880,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
 
     if not consumed_ok:
         path = (
-            str((request.payload or {}).get("path", ""))
-            if request is not None
-            else ""
+            str((request.payload or {}).get("path", "")) if request is not None else ""
         )
         status_value = status.value if status else "unknown"
         audit.record_event(
@@ -942,9 +926,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         except UnicodeDecodeError as exc:
             raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
-        new_text, additions, deletions = apply_patch_text(
-            original_text, patch, path
-        )
+        new_text, additions, deletions = apply_patch_text(original_text, patch, path)
 
         bytes_before = len(original_text.encode("utf-8"))
         bytes_after = len(new_text.encode("utf-8"))
