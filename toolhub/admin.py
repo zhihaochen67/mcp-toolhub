@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 
 from toolhub.security import approval
-from toolhub.security.approval import ApprovalRequest
+from toolhub.security.approval import ApprovalRequest, ApprovalStatus
+from toolhub.security.executable_snapshot import (
+    parse_executable_snapshot,
+    validate_executable_snapshot,
+)
 
 
 def _sha256_text(value: str) -> str:
@@ -51,6 +56,46 @@ def _describe_mutation(request: ApprovalRequest) -> str:
     return "\n".join(lines)
 
 
+def _json_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _describe_shell(request: ApprovalRequest) -> str:
+    """Render exact shell request fields without shell-quoting ambiguity."""
+    lines = [
+        "  kind:                 shell",
+        f"  requested_program:    {_json_string(request.program)}",
+    ]
+
+    try:
+        snapshot = parse_executable_snapshot(
+            request.payload.get("executable_snapshot")
+        )
+    except (TypeError, ValueError) as exc:
+        lines.append(f"  executable_snapshot:  INVALID ({exc})")
+    else:
+        lines.extend(
+            [
+                f"  resolved_executable:  {_json_string(str(snapshot.path))}",
+                f"  executable_sha256:    {snapshot.sha256}",
+                f"  executable_size:      {snapshot.size} bytes",
+            ]
+        )
+
+    lines.extend(
+        [
+            f"  cwd:                  {_json_string(request.cwd)}",
+            f"  argument_count:       {len(request.args)}",
+        ]
+    )
+    lines.extend(
+        f"  args[{index}]:              {_json_string(argument)}"
+        for index, argument in enumerate(request.args)
+    )
+    lines.append("  identity_scope:       primary executable only")
+    return "\n".join(lines)
+
+
 def _format_request(request: ApprovalRequest) -> str:
     decided = request.decided_at.isoformat() if request.decided_at else "-"
 
@@ -60,10 +105,7 @@ def _format_request(request: ApprovalRequest) -> str:
     ]
 
     if request.kind == "shell":
-        args = " ".join(request.args) if request.args else ""
-        lines.append("  kind:         shell")
-        lines.append(f"  command:      {request.program} {args}".rstrip())
-        lines.append(f"  cwd:          {request.cwd}")
+        lines.append(_describe_shell(request))
     else:
         lines.append(f"  kind:         {request.kind}")
         lines.append(_describe_mutation(request))
@@ -91,6 +133,41 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
+    request = approval.get_request(args.request_id)
+    if request is None:
+        print(f"error: Unknown approval request: {args.request_id}", file=sys.stderr)
+        return 1
+
+    print("Approval candidate:")
+    print(_format_request(request))
+
+    if request.status != ApprovalStatus.PENDING:
+        print(
+            f"error: Approval request is {request.status.value}: {request.request_id}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if request.kind == "shell":
+        try:
+            validate_executable_snapshot(
+                request.payload.get("executable_snapshot")
+            )
+        except (TypeError, ValueError) as exc:
+            print(f"error: Invalid executable snapshot: {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        confirmation = input(
+            f"Type APPROVE to approve {request.request_id}: "
+        )
+    except EOFError:
+        confirmation = ""
+
+    if confirmation != "APPROVE":
+        print("Approval cancelled.", file=sys.stderr)
+        return 1
+
     try:
         request = approval.approve_request(args.request_id)
     except KeyError as exc:
@@ -101,7 +178,6 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return 1
 
     print(f"Approved {request.request_id}.")
-    print(_format_request(request))
     return 0
 
 

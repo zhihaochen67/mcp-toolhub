@@ -9,15 +9,21 @@ from pydantic import BaseModel
 from toolhub.observability import audit
 from toolhub.security import approval
 from toolhub.security.approval import ApprovalStatus
+from toolhub.security.command_policy import (
+    CommandPolicyDecision,
+    assess_shell_command,
+)
+from toolhub.security.executable_snapshot import (
+    resolve_executable_snapshot,
+    validate_executable_snapshot,
+)
 from toolhub.security.paths import (
     get_workspace_root,
     relative_workspace_path,
     resolve_workspace_path,
+    validate_workspace_snapshot,
 )
-from toolhub.security.risk import (
-    RiskLevel,
-    assess_shell_command,
-)
+from toolhub.security.risk import RiskLevel
 
 MAX_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 20_000
@@ -88,6 +94,8 @@ def _execute_subprocess(
     tool: str,
     trace_id: str,
     action: str,
+    execution_program: str,
+    policy_metadata: dict[str, object] | None = None,
     request_id: str | None = None,
     approval_status: ApprovalStatus | None = None,
     message: str = "",
@@ -99,11 +107,16 @@ def _execute_subprocess(
     """
     relative_cwd = relative_workspace_path(working_directory)
     arguments = {"program": program, "args": args}
+    audit_extra = (
+        {"command_policy": policy_metadata}
+        if policy_metadata is not None
+        else None
+    )
     started = time.monotonic()
 
     try:
         completed = subprocess.run(
-            [program, *args],
+            [execution_program, *args],
             cwd=working_directory,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -133,6 +146,7 @@ def _execute_subprocess(
             error_type=type(exc).__name__,
             stdout_chars=len(_to_text(exc.stdout)),
             stderr_chars=len(_to_text(exc.stderr)),
+            extra=audit_extra,
         )
 
         return ShellRunResult(
@@ -166,6 +180,7 @@ def _execute_subprocess(
             cwd=relative_cwd,
             error=str(exc),
             error_type=type(exc).__name__,
+            extra=audit_extra,
         )
 
         if isinstance(exc, FileNotFoundError):
@@ -193,6 +208,7 @@ def _execute_subprocess(
         cwd=relative_cwd,
         stdout_chars=len(completed.stdout),
         stderr_chars=len(completed.stderr),
+        extra=audit_extra,
     )
 
     return ShellRunResult(
@@ -208,6 +224,51 @@ def _execute_subprocess(
         request_id=request_id,
         approval_status=approval_status,
         message=message,
+    )
+
+
+def _execute_intrinsic_low(
+    program: str,
+    args: list[str],
+    working_directory: Path,
+    decision: CommandPolicyDecision,
+    *,
+    trace_id: str,
+) -> ShellRunResult:
+    """Return a LOW intrinsic result without starting a subprocess."""
+    if decision.level != RiskLevel.LOW or decision.intrinsic_stdout is None:
+        raise RuntimeError("Invalid intrinsic LOW command-policy decision")
+
+    started = time.monotonic()
+    relative_cwd = relative_workspace_path(working_directory)
+    policy_metadata = decision.audit_metadata()
+    stdout = decision.intrinsic_stdout
+
+    audit.record_event(
+        trace_id=trace_id,
+        tool="shell.run",
+        action="execute",
+        risk=decision.level,
+        executed=True,
+        success=True,
+        duration_ms=_elapsed_ms(started),
+        returncode=0,
+        arguments={"program": program, "args": args},
+        cwd=relative_cwd,
+        stdout_chars=len(stdout),
+        stderr_chars=0,
+        extra={"command_policy": policy_metadata},
+    )
+
+    return ShellRunResult(
+        program=program,
+        args=args,
+        cwd=relative_cwd,
+        risk=decision.level,
+        risk_reason=decision.reason,
+        executed=True,
+        returncode=0,
+        stdout=stdout,
     )
 
 
@@ -239,11 +300,59 @@ def run_shell(
     started = time.monotonic()
     command_args = list(args or [])
 
-    assessment = assess_shell_command(program, command_args)
-
     try:
         working_directory = _resolve_working_directory(cwd)
     except (FileNotFoundError, ValueError) as exc:
+        audit.record_event(
+            trace_id=trace_id,
+            tool="shell.run",
+            action="failure",
+            risk=RiskLevel.HIGH,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"program": program, "args": command_args},
+            cwd=cwd,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            extra={
+                "command_policy": {
+                    "decision": "refused",
+                    "risk": RiskLevel.HIGH.value,
+                    "reason": (
+                        "Working directory validation failed before executable "
+                        "identity resolution."
+                    ),
+                }
+            },
+        )
+        raise
+
+    assessment = assess_shell_command(
+        program,
+        command_args,
+        working_directory=working_directory,
+        workspace_root=get_workspace_root(),
+    )
+    policy_metadata = assessment.audit_metadata()
+    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
+    relative_cwd = relative_workspace_path(working_directory)
+
+    if assessment.level == RiskLevel.LOW:
+        return _execute_intrinsic_low(
+            program,
+            command_args,
+            working_directory,
+            assessment,
+            trace_id=trace_id,
+        )
+
+    try:
+        executable_snapshot = resolve_executable_snapshot(
+            program,
+            working_directory=working_directory,
+        )
+    except (TypeError, ValueError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool="shell.run",
@@ -253,28 +362,18 @@ def run_shell(
             success=False,
             duration_ms=_elapsed_ms(started),
             arguments={"program": program, "args": command_args},
-            cwd=cwd,
+            cwd=relative_cwd,
             error=str(exc),
-            error_type=type(exc).__name__,
+            error_type="ExecutableResolutionError",
+            extra={"command_policy": policy_metadata},
         )
         raise
 
-    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
-    relative_cwd = relative_workspace_path(working_directory)
-
-    if assessment.level == RiskLevel.LOW:
-        return _execute_subprocess(
-            program,
-            command_args,
-            working_directory,
-            timeout_seconds,
-            assessment.level,
-            assessment.reason,
-            tool="shell.run",
-            trace_id=trace_id,
-            action="execute",
-        )
-
+    executable_metadata = executable_snapshot.to_payload()
+    policy_metadata["approval_executable"] = executable_snapshot.audit_metadata(
+        requested_program=program,
+        workspace_root=get_workspace_root(),
+    )
     request = approval.create_request(
         program=program,
         args=command_args,
@@ -282,7 +381,11 @@ def run_shell(
         timeout_seconds=timeout_seconds,
         risk=assessment.level,
         risk_reason=assessment.reason,
-        payload={"workspace_root": str(get_workspace_root())},
+        payload={
+            "workspace_root": str(get_workspace_root()),
+            "command_policy": policy_metadata,
+            "executable_snapshot": executable_metadata,
+        },
     )
 
     audit.record_event(
@@ -297,6 +400,7 @@ def run_shell(
         duration_ms=_elapsed_ms(started),
         arguments={"program": program, "args": command_args},
         cwd=relative_cwd,
+        extra={"command_policy": policy_metadata},
     )
 
     return ShellRunResult(
@@ -352,6 +456,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
 
     trace_id = audit.new_trace_id()
     started = time.monotonic()
+    policy_metadata: dict[str, object] | None = None
 
     def audit_rejection(*, status, error, error_type="ApprovalStateError", program="", args=None, cwd=".", risk=None):
         audit.record_event(
@@ -368,6 +473,11 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             cwd=cwd,
             error=error,
             error_type=error_type,
+            extra=(
+                {"command_policy": policy_metadata}
+                if policy_metadata is not None
+                else None
+            ),
         )
 
     request = approval.get_request(request_id)
@@ -405,37 +515,27 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             message=f"Request is {request.status.value}; cannot execute.",
         )
 
-    approved_workspace = request.payload.get("workspace_root")
-    if approved_workspace is not None:
-        try:
-            workspace_matches = (
-                Path(str(approved_workspace)).resolve(strict=True)
-                == get_workspace_root()
-            )
-        except (OSError, RuntimeError):
-            workspace_matches = False
-
-        if not workspace_matches:
-            message = "Approval was created for a different ToolHub workspace."
-            audit_rejection(
-                status=request.status,
-                program=request.program,
-                args=request.args,
-                cwd=request.cwd,
-                risk=request.risk,
-                error=message,
-                error_type="WorkspaceBoundaryViolation",
-            )
-            return _rejected_result(
-                request_id,
-                program=request.program,
-                args=request.args,
-                cwd=request.cwd,
-                risk=request.risk,
-                risk_reason=request.risk_reason,
-                status=request.status,
-                message=message,
-            )
+    if request.kind != "shell":
+        message = f"Approval request kind is {request.kind!r}; expected 'shell'."
+        audit_rejection(
+            status=request.status,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            error=message,
+            error_type="ApprovalKindMismatch",
+        )
+        return _rejected_result(
+            request_id,
+            program=request.program,
+            args=request.args,
+            cwd=request.cwd,
+            risk=request.risk,
+            risk_reason=request.risk_reason,
+            status=request.status,
+            message=message,
+        )
 
     # Atomically APPROVED -> CONSUMED. Single-use: a second call fails here.
     consumed = approval.consume_request(request_id)
@@ -462,10 +562,38 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             message=f"Approval could not be consumed (status {status.value}).",
         )
 
+    stored_policy = consumed.payload.get("command_policy")
+    if isinstance(stored_policy, dict):
+        policy_metadata = stored_policy
+
+    try:
+        validate_workspace_snapshot(consumed.payload, get_workspace_root())
+    except (TypeError, ValueError) as exc:
+        message = f"Approval workspace identity is invalid: {exc}"
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error=message,
+            error_type="WorkspaceBoundaryViolation",
+        )
+        return _rejected_result(
+            request_id,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            risk_reason=consumed.risk_reason,
+            status=consumed.status,
+            message=message,
+        )
+
     # Re-validate the stored cwd against the workspace (defense in depth).
     try:
         working_directory = resolve_workspace_path(consumed.cwd)
-    except ValueError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         audit_rejection(
             status=consumed.status,
             program=consumed.program,
@@ -509,6 +637,32 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
 
     timeout_seconds = max(1, min(consumed.timeout_seconds, MAX_TIMEOUT_SECONDS))
 
+    try:
+        execution_program = validate_executable_snapshot(
+            consumed.payload.get("executable_snapshot")
+        )
+    except (TypeError, ValueError) as exc:
+        message = f"Approved executable identity is no longer valid: {exc}"
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error=message,
+            error_type="ExecutableIdentityMismatch",
+        )
+        return _rejected_result(
+            request_id,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            risk_reason=consumed.risk_reason,
+            status=consumed.status,
+            message=message,
+        )
+
     return _execute_subprocess(
         consumed.program,
         consumed.args,
@@ -519,6 +673,8 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         tool="shell.run_approved",
         trace_id=trace_id,
         action="execute_approved",
+        execution_program=str(execution_program),
+        policy_metadata=policy_metadata,
         request_id=request_id,
         approval_status=consumed.status,
     )
