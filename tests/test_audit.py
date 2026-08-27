@@ -8,8 +8,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-import pytest
-
+from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
@@ -265,6 +264,8 @@ def test_timeout_audited(monkeypatch):
     result = run_approved_shell(request.request_id)
     assert result.executed is True
     assert result.timed_out is True
+    assert result.outcome == ContractOutcome.TIMED_OUT
+    assert result.error.code == "COMMAND_TIMED_OUT"
 
     event = _last_event()
     assert event["action"] == "timeout"
@@ -282,8 +283,9 @@ def test_execution_failure_audited(monkeypatch):
     request = _create_request(program="pytest", args=["-q"])
     approval.approve_request(request.request_id)
 
-    with pytest.raises(ValueError, match="Executable not found"):
-        run_approved_shell(request.request_id)
+    result = run_approved_shell(request.request_id)
+    assert result.outcome == ContractOutcome.FAILED
+    assert result.error.code == "COMMAND_START_FAILED"
 
     event = _last_event()
     assert event["action"] == "failure"

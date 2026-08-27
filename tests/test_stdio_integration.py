@@ -28,7 +28,9 @@ EXPECTED_TOOLS = {
     "shell.run",
     "shell.run_approved",
     "toolhub.audit_recent",
+    "toolhub.capabilities",
     "toolhub.ping",
+    "toolhub.request_status",
 }
 
 
@@ -99,9 +101,8 @@ def _default_state_environment(workspace: Path, state_base: Path) -> dict[str, s
 
 def _json_result(result) -> dict:
     assert result.is_error is False
-    texts = [item.text for item in result.content if hasattr(item, "text")]
-    assert texts
-    return json.loads(texts[0])
+    assert result.structured_content is not None
+    return result.structured_content
 
 
 async def _exercise_stdio(
@@ -121,7 +122,7 @@ async def _exercise_stdio(
         env=environment,
     )
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with stdio_client(parameters) as streams:
             async with ClientSession(*streams) as session:
                 initialized = await session.initialize()
@@ -133,6 +134,12 @@ async def _exercise_stdio(
                 assert names == EXPECTED_TOOLS
                 assert "toolhub.approve" not in names
                 assert not any(name.startswith("admin.") for name in names)
+
+                capabilities = _json_result(
+                    await session.call_tool("toolhub.capabilities", {})
+                )
+                assert capabilities["contract_version"] == "1.0"
+                assert capabilities["transport"] == "stdio"
 
                 ping = _json_result(
                     await session.call_tool(
@@ -155,26 +162,228 @@ async def _exercise_stdio(
                 assert read["path"] == "marker.txt"
                 assert read["content"] == marker
 
+                write_request = _json_result(
+                    await session.call_tool(
+                        "filesystem.write_file",
+                        {"path": "contract.txt", "content": "before\n"},
+                    )
+                )
+                assert write_request["outcome"] == "APPROVAL_REQUIRED"
+                write_handle = write_request["approval"]
+                assert write_handle["request_id"] == write_request["request_id"]
+                assert write_handle["resume_tool"] == "filesystem.write_file_approved"
+                assert write_handle["expires_at"]
+                write_trace = write_request["trace_id"]
+
+                write_pending = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": write_handle["request_id"]},
+                    )
+                )
+                assert write_pending["outcome"] == "APPROVAL_PENDING"
+                assert write_pending["trace_id"] == write_trace
+
+                code, _stdout, stderr = await _admin_command(
+                    admin,
+                    ["approve", write_handle["request_id"]],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                    confirmation=True,
+                )
+                assert code == 0, stderr
+                write_approved = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": write_handle["request_id"]},
+                    )
+                )
+                assert write_approved["outcome"] == "APPROVAL_APPROVED"
+                assert write_approved["trace_id"] == write_trace
+
+                write_done = _json_result(
+                    await session.call_tool(
+                        write_handle["resume_tool"],
+                        {"request_id": write_handle["request_id"]},
+                    )
+                )
+                assert write_done["outcome"] == "SUCCEEDED"
+                assert write_done["trace_id"] == write_trace
+                assert write_done["executed"] is True
+                read_written = _json_result(
+                    await session.call_tool(
+                        "filesystem.read_file", {"path": "contract.txt"}
+                    )
+                )
+                assert read_written["content"] == "before\n"
+
+                write_consumed = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": write_handle["request_id"]},
+                    )
+                )
+                assert write_consumed["outcome"] == "APPROVAL_CONSUMED"
+                assert write_consumed["trace_id"] == write_trace
+                write_replay = _json_result(
+                    await session.call_tool(
+                        write_handle["resume_tool"],
+                        {"request_id": write_handle["request_id"]},
+                    )
+                )
+                assert write_replay["outcome"] == "APPROVAL_CONSUMED"
+                assert write_replay["error"]["code"] == "APPROVAL_CONSUMED"
+                assert write_replay["trace_id"] == write_trace
+
+                patch_request = _json_result(
+                    await session.call_tool(
+                        "filesystem.apply_patch",
+                        {
+                            "path": "contract.txt",
+                            "patch": (
+                                "--- contract.txt\n"
+                                "+++ contract.txt\n"
+                                "@@ -1,1 +1,1 @@\n"
+                                "-before\n"
+                                "+after\n"
+                            ),
+                        },
+                    )
+                )
+                assert patch_request["outcome"] == "APPROVAL_REQUIRED"
+                patch_handle = patch_request["approval"]
+                patch_trace = patch_request["trace_id"]
+                assert patch_handle["resume_tool"] == "filesystem.apply_patch_approved"
+                patch_pending = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": patch_handle["request_id"]},
+                    )
+                )
+                assert patch_pending["outcome"] == "APPROVAL_PENDING"
+                assert patch_pending["trace_id"] == patch_trace
+                code, _stdout, stderr = await _admin_command(
+                    admin,
+                    ["approve", patch_handle["request_id"]],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                    confirmation=True,
+                )
+                assert code == 0, stderr
+                patch_approved = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": patch_handle["request_id"]},
+                    )
+                )
+                assert patch_approved["outcome"] == "APPROVAL_APPROVED"
+                assert patch_approved["trace_id"] == patch_trace
+                patch_done = _json_result(
+                    await session.call_tool(
+                        patch_handle["resume_tool"],
+                        {"request_id": patch_handle["request_id"]},
+                    )
+                )
+                assert patch_done["outcome"] == "SUCCEEDED"
+                assert patch_done["trace_id"] == patch_trace
+                assert patch_done["changed"] is True
+                assert (workspace / "contract.txt").read_text(encoding="utf-8") == (
+                    "after\n"
+                )
+                patch_consumed = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": patch_handle["request_id"]},
+                    )
+                )
+                assert patch_consumed["outcome"] == "APPROVAL_CONSUMED"
+                assert patch_consumed["trace_id"] == patch_trace
+                patch_replay = _json_result(
+                    await session.call_tool(
+                        patch_handle["resume_tool"],
+                        {"request_id": patch_handle["request_id"]},
+                    )
+                )
+                assert patch_replay["outcome"] == "APPROVAL_CONSUMED"
+                assert patch_replay["error"]["code"] == "APPROVAL_CONSUMED"
+
+                rejected_request = _json_result(
+                    await session.call_tool(
+                        "filesystem.write_file",
+                        {"path": "rejected.txt", "content": "must-not-run"},
+                    )
+                )
+                rejected_handle = rejected_request["approval"]
+                code, _stdout, stderr = await _admin_command(
+                    admin,
+                    ["reject", rejected_handle["request_id"]],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                )
+                assert code == 0, stderr
+                rejected_status = _json_result(
+                    await session.call_tool(
+                        "toolhub.request_status",
+                        {"request_id": rejected_handle["request_id"]},
+                    )
+                )
+                assert rejected_status["outcome"] == "APPROVAL_REJECTED"
+                rejected_resume = _json_result(
+                    await session.call_tool(
+                        rejected_handle["resume_tool"],
+                        {"request_id": rejected_handle["request_id"]},
+                    )
+                )
+                assert rejected_resume["outcome"] == "APPROVAL_REJECTED"
+                assert rejected_resume["error"]["code"] == "APPROVAL_REJECTED"
+                assert not (workspace / "rejected.txt").exists()
+
+                runtime_python = Path(server).parent / (
+                    "python.exe" if os.name == "nt" else "python"
+                )
+                assert runtime_python.is_file()
                 shell_request = _json_result(
                     await session.call_tool(
                         "shell.run",
-                        {"program": "git", "args": ["--version"]},
+                        {
+                            "program": str(runtime_python),
+                            "args": ["-c", "print('toolhub-shell-ok')"],
+                        },
                     )
                 )
+                assert shell_request["outcome"] == "APPROVAL_REQUIRED"
                 assert shell_request["executed"] is False
                 request_id = shell_request["request_id"]
                 assert request_id.startswith("req_")
+                shell_trace = shell_request["trace_id"]
+                shell_handle = shell_request["approval"]
+                assert shell_handle["resume_tool"] == "shell.run_approved"
 
-                admin_result = await anyio.run_process(
-                    [admin, "list"],
-                    cwd=str(launch_directory),
-                    env=environment,
-                    check=False,
+                code, admin_stdout, admin_stderr = await _admin_command(
+                    admin,
+                    ["list"],
+                    launch_directory=launch_directory,
+                    environment=environment,
                 )
-                admin_stderr = admin_result.stderr.decode(errors="replace")
-                admin_stdout = admin_result.stdout.decode(errors="replace")
-                assert admin_result.returncode == 0, admin_stderr
+                assert code == 0, admin_stderr
                 assert request_id in admin_stdout
+                code, _stdout, admin_stderr = await _admin_command(
+                    admin,
+                    ["approve", request_id],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                    confirmation=True,
+                )
+                assert code == 0, admin_stderr
+                shell_done = _json_result(
+                    await session.call_tool(
+                        shell_handle["resume_tool"], {"request_id": request_id}
+                    )
+                )
+                assert shell_done["outcome"] == "SUCCEEDED"
+                assert shell_done["trace_id"] == shell_trace
+                assert shell_done["returncode"] == 0
+                assert shell_done["stdout"] == "toolhub-shell-ok\n"
 
 
 def test_stdio_initialize_tools_ping_workspace_and_admin_state(external_runtime_dir):
@@ -298,7 +507,30 @@ async def _exercise_two_workspace_isolation(
 
             wrong_workspace = await approved(session_b, request_a)
             assert wrong_workspace["executed"] is False
-            assert "Unknown approval request" in wrong_workspace["message"]
+            assert wrong_workspace["outcome"] == "REFUSED"
+            assert wrong_workspace["error"]["code"] == "REQUEST_NOT_FOUND"
+
+            other_status = _json_result(
+                await session_b.call_tool(
+                    "toolhub.request_status",
+                    {"request_id": request_a},
+                )
+            )
+            unknown_status = _json_result(
+                await session_b.call_tool(
+                    "toolhub.request_status",
+                    {"request_id": "req_" + "0" * 32},
+                )
+            )
+            for result in (other_status, unknown_status):
+                assert result["outcome"] == "REFUSED"
+                assert result["approval"] is None
+                assert result["error"] == {
+                    "code": "REQUEST_NOT_FOUND",
+                    "message": "Approval request is unavailable.",
+                    "retryable": False,
+                }
+            assert other_status["trace_id"] != request_a
 
             code, stdout, stderr = await _admin_command(
                 admin,

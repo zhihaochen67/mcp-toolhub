@@ -6,6 +6,7 @@ from mcp_toolhub.security.paths import (
     initialize_runtime_configuration,
 )
 from mcp_toolhub.tools.audit import register_audit_tools
+from mcp_toolhub.tools.control import register_control_tools
 from mcp_toolhub.tools.filesystem import register_filesystem_tools
 from mcp_toolhub.tools.git import register_git_tools
 from mcp_toolhub.tools.shell import register_shell_tools
@@ -38,4 +39,5 @@ def create_server(configuration: RuntimeConfiguration | None = None) -> MCPServe
     register_shell_tools(server)
     register_git_tools(server)
     register_audit_tools(server)
+    register_control_tools(server)
     return server

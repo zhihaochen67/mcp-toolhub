@@ -22,6 +22,7 @@ Security properties
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -29,21 +30,22 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from mcp_toolhub.contracts import (
+    ApprovalHandle,
+    ApprovalStatus,
+    resume_tool_for_kind,
+)
+from mcp_toolhub.observability.audit import new_trace_id
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.risk import RiskLevel
 
 
-class ApprovalStatus(str, Enum):
-    PENDING = "PENDING"
-    APPROVED = "APPROVED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
-    CONSUMED = "CONSUMED"
+class ApprovalStoreError(RuntimeError):
+    """The trusted approval store is malformed or incompatible."""
 
 
 class ApprovalRequest(BaseModel):
@@ -54,6 +56,8 @@ class ApprovalRequest(BaseModel):
     ``payload``. Only bounded metadata of mutations should ever be shown or
     logged outside the secure store.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     request_id: str
 
@@ -72,6 +76,17 @@ class ApprovalRequest(BaseModel):
     created_at: datetime
     expires_at: datetime
     decided_at: datetime | None = None
+    trace_id: str
+    resume_tool: str
+
+    def public_handle(self) -> ApprovalHandle:
+        """Return lifecycle metadata safe for the agent-facing contract."""
+        return ApprovalHandle(
+            request_id=self.request_id,
+            status=self.status,
+            expires_at=self.expires_at,
+            resume_tool=self.resume_tool,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -79,7 +94,8 @@ class ApprovalRequest(BaseModel):
 # --------------------------------------------------------------------------
 
 DEFAULT_TTL_SECONDS = 300  # 5 minutes
-STORE_VERSION = 1
+STORE_VERSION = 2
+_READABLE_STORE_VERSIONS = frozenset({1, STORE_VERSION})
 
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_STALE_SECONDS = 15.0
@@ -121,24 +137,79 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
 
     try:
         raw = json.loads(store_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        # A corrupt/unreadable store contains no approvals -> fail closed.
-        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ApprovalStoreError("Approval store is unreadable or malformed.") from exc
 
     if not isinstance(raw, dict):
-        return {}
+        raise ApprovalStoreError("Approval store must contain a JSON object.")
+
+    version = raw.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ApprovalStoreError("Approval store version is missing or malformed.")
+    if version not in _READABLE_STORE_VERSIONS:
+        raise ApprovalStoreError(f"Unsupported approval store version: {version}")
 
     payload = raw.get("requests")
     if not isinstance(payload, dict):
-        return {}
+        raise ApprovalStoreError("Approval store requests are missing or malformed.")
 
     requests: dict[str, ApprovalRequest] = {}
 
     for request_id, data in payload.items():
+        if not isinstance(request_id, str) or not isinstance(data, dict):
+            raise ApprovalStoreError("Approval store contains a malformed request.")
+
+        normalized = dict(data)
+        if version == 1:
+            request_payload = normalized.get("payload")
+            payload_trace = (
+                request_payload.get("trace_id")
+                if isinstance(request_payload, dict)
+                else None
+            )
+            if not isinstance(payload_trace, str) or not payload_trace:
+                legacy_material = {
+                    "store_request_id": request_id,
+                    "record": normalized,
+                }
+                encoded = json.dumps(
+                    legacy_material,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                payload_trace = "trc_legacy_" + hashlib.sha256(encoded).hexdigest()[:32]
+            normalized.setdefault("trace_id", payload_trace)
+            try:
+                normalized.setdefault(
+                    "resume_tool",
+                    resume_tool_for_kind(str(normalized.get("kind", "shell"))),
+                )
+            except ValueError as exc:
+                raise ApprovalStoreError(
+                    "Approval store contains an unsupported request kind."
+                ) from exc
+
         try:
-            requests[request_id] = ApprovalRequest.model_validate(data)
-        except ValidationError:
-            continue
+            request = ApprovalRequest.model_validate(normalized)
+        except ValidationError as exc:
+            raise ApprovalStoreError(
+                f"Approval store request is malformed: {request_id}"
+            ) from exc
+
+        if request.request_id != request_id:
+            raise ApprovalStoreError(
+                "Approval request ID does not match its store key."
+            )
+        try:
+            expected_resume = resume_tool_for_kind(request.kind)
+        except ValueError as exc:
+            raise ApprovalStoreError(
+                "Approval store contains an unsupported request kind."
+            ) from exc
+        if request.resume_tool != expected_resume:
+            raise ApprovalStoreError("Approval request resume tool is invalid.")
+        requests[request_id] = request
 
     return requests
 
@@ -290,6 +361,7 @@ def create_request(
     risk_reason: str,
     kind: str = "shell",
     payload: dict | None = None,
+    trace_id: str | None = None,
     ttl_seconds: int | None = None,
     store_path: Path | None = None,
     now: datetime | None = None,
@@ -317,6 +389,8 @@ def create_request(
         created_at=current,
         expires_at=current + timedelta(seconds=ttl),
         decided_at=None,
+        trace_id=trace_id or new_trace_id(),
+        resume_tool=resume_tool_for_kind(kind),
     )
 
     with _store_lock(path):
@@ -353,6 +427,22 @@ def get_request(
         )
         return request.model_copy(update={"status": ApprovalStatus.EXPIRED})
 
+    return request
+
+
+def observe_request(
+    request_id: str,
+    store_path: Path | None = None,
+    now: datetime | None = None,
+) -> ApprovalRequest | None:
+    """Observe effective request state without writing or consuming anything."""
+    path = store_path or _default_store_path()
+    current = now or _now()
+    request = _read_store(path).get(request_id)
+    if request is None:
+        return None
+    if _expired(request, current):
+        return request.model_copy(update={"status": ApprovalStatus.EXPIRED})
     return request
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.paths import (
@@ -385,8 +386,10 @@ def test_external_workspace_mutation_symlink_protection_still_applies(
 
     monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
 
-    with pytest.raises(ValueError, match="Symlinks are not allowed"):
-        write_file("link/file.txt", "blocked")
+    result = write_file("link/file.txt", "blocked")
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_toolhub_state_stays_outside_workspace_and_is_not_agent_readable(

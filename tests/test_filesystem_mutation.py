@@ -8,19 +8,23 @@ import hashlib
 import os
 import secrets
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.risk import RiskLevel
+from mcp_toolhub.tools import filesystem as filesystem_tools
+from mcp_toolhub.tools.control import request_status
 from mcp_toolhub.tools.filesystem import (
     MAX_PATCH_CHARS,
     MAX_WRITE_BYTES,
-    MutationConflictError,
     apply_patch,
     apply_patch_approved,
     read_file,
@@ -127,8 +131,10 @@ def test_write_file_modifies_existing_file(temp_dir):
 
 
 def test_write_file_create_parents_false_rejects_missing_parent(temp_dir):
-    with pytest.raises(FileNotFoundError):
-        write_file("missing/dir/a.txt", "x", root=temp_dir)
+    result = write_file("missing/dir/a.txt", "x", root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_write_file_create_parents_true_works(temp_dir):
@@ -140,18 +146,20 @@ def test_write_file_create_parents_true_works(temp_dir):
 
 
 def test_write_file_traversal_rejected(temp_dir):
-    with pytest.raises(ValueError, match="escapes"):
-        write_file("../escape.txt", "x", root=temp_dir)
+    result = write_file("../escape.txt", "x", root=temp_dir)
 
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
     assert not (temp_dir.parent / "escape.txt").exists()
 
 
 def test_write_file_absolute_path_rejected(temp_dir):
     outside = temp_dir.parent / "outside.txt"
 
-    with pytest.raises(ValueError, match="Absolute"):
-        write_file(str(outside), "x", root=temp_dir)
+    result = write_file(str(outside), "x", root=temp_dir)
 
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
     assert not outside.exists()
 
 
@@ -168,23 +176,28 @@ def test_write_file_absolute_path_rejected(temp_dir):
     ],
 )
 def test_workspace_relative_paths_reject_foreign_root_syntax(temp_dir, path):
-    with pytest.raises(ValueError, match="Absolute"):
-        write_file(path, "x", root=temp_dir)
+    result = write_file(path, "x", root=temp_dir)
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
     with pytest.raises(ValueError, match="escapes workspace"):
         read_file(path, root=temp_dir)
 
 
 def test_write_file_oversized_content_rejected(temp_dir):
-    with pytest.raises(ValueError, match="too large"):
-        write_file("a.txt", "x" * (MAX_WRITE_BYTES + 1), root=temp_dir)
+    result = write_file("a.txt", "x" * (MAX_WRITE_BYTES + 1), root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_write_file_symlink_component_rejected(temp_dir, monkeypatch):
     monkeypatch.setattr(Path, "is_symlink", lambda self: self.name == "link")
 
-    with pytest.raises(ValueError, match="Symlinks are not allowed"):
-        write_file("link/a.txt", "x", root=temp_dir)
+    result = write_file("link/a.txt", "x", root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_write_file_real_symlink_escape_rejected(temp_dir):
@@ -199,9 +212,10 @@ def test_write_file_real_symlink_escape_rejected(temp_dir):
         pytest.skip(f"symlinks not supported in this environment: {exc}")
 
     try:
-        with pytest.raises(ValueError, match="[Ss]ymlink"):
-            write_file("link/secret.txt", "x", root=temp_dir)
+        result = write_file("link/secret.txt", "x", root=temp_dir)
 
+        assert result.outcome == ContractOutcome.REFUSED
+        assert result.error.code == "MUTATION_REFUSED"
         assert (outside / "secret.txt").read_text(encoding="utf-8") == "secret"
     finally:
         link.unlink()
@@ -222,9 +236,10 @@ def test_write_file_expected_hash_match_succeeds(temp_dir):
 def test_write_file_stale_expected_hash_conflict(temp_dir):
     _put(temp_dir, "a.txt", "current")
 
-    with pytest.raises(MutationConflictError, match="Conflict"):
-        write_file("a.txt", "updated", expected_hash=_sha("stale"), root=temp_dir)
+    result = write_file("a.txt", "updated", expected_hash=_sha("stale"), root=temp_dir)
 
+    assert result.outcome == ContractOutcome.CONFLICT
+    assert result.error.code == "MUTATION_CONFLICT"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "current"
 
 
@@ -238,10 +253,53 @@ def test_write_file_approved_conflict_at_execution(temp_dir):
     _put(temp_dir, "a.txt", "tampered")
     approval.approve_request(result.request_id)
 
-    with pytest.raises(MutationConflictError, match="Conflict"):
-        write_file_approved(result.request_id, root=temp_dir)
+    conflict = write_file_approved(result.request_id, root=temp_dir)
+    status = request_status(result.request_id)
+    replay = write_file_approved(result.request_id, root=temp_dir)
 
+    assert conflict.outcome == ContractOutcome.CONFLICT
+    assert conflict.error.code == "MUTATION_CONFLICT"
+    assert status.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert replay.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert {result.trace_id, conflict.trace_id, status.trace_id, replay.trace_id} == {
+        result.trace_id
+    }
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "tampered"
+
+
+def test_write_file_deleted_after_approval_is_conflict_and_consumed(temp_dir):
+    target = _put(temp_dir, "a.txt", "current")
+    result = write_file(
+        "a.txt", "updated", expected_hash=_sha("current"), root=temp_dir
+    )
+    approval.approve_request(result.request_id)
+    target.unlink()
+
+    conflict = write_file_approved(result.request_id, root=temp_dir)
+    status = request_status(result.request_id)
+    replay = write_file_approved(result.request_id, root=temp_dir)
+
+    assert conflict.outcome == ContractOutcome.CONFLICT
+    assert conflict.error.code == "MUTATION_CONFLICT"
+    assert conflict.approval.status == ApprovalStatus.CONSUMED
+    assert status.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert replay.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert {result.trace_id, conflict.trace_id, status.trace_id, replay.trace_id} == {
+        result.trace_id
+    }
+    assert not target.exists()
+
+
+def test_write_file_created_without_expected_hash_remains_blind_write(temp_dir):
+    result = write_file("new.txt", "approved", root=temp_dir)
+    target = _put(temp_dir, "new.txt", "created-after-request")
+    approval.approve_request(result.request_id)
+
+    done = write_file_approved(result.request_id, root=temp_dir)
+
+    assert done.outcome == ContractOutcome.SUCCEEDED
+    assert done.created is False
+    assert target.read_text(encoding="utf-8") == "approved"
 
 
 def test_write_atomic_no_temp_leftovers(temp_dir):
@@ -262,9 +320,10 @@ def test_write_failure_leaves_file_unchanged(temp_dir, monkeypatch):
 
     monkeypatch.setattr("mcp_toolhub.tools.filesystem.open", boom, raising=False)
 
-    with pytest.raises(OSError):
-        write_file_approved(result.request_id, root=temp_dir)
+    failed = write_file_approved(result.request_id, root=temp_dir)
 
+    assert failed.outcome == ContractOutcome.FAILED
+    assert failed.error.code == "FILE_WRITE_FAILED"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "original"
     leftovers = [p.name for p in temp_dir.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == []
@@ -304,9 +363,10 @@ def test_apply_patch_valid_patch_succeeds(temp_dir):
 def test_apply_patch_malformed_rejected(temp_dir):
     _put(temp_dir, "a.txt", "a\n")
 
-    with pytest.raises(ValueError, match="[Mm]alformed"):
-        apply_patch("a.txt", "this is not a patch", root=temp_dir)
+    result = apply_patch("a.txt", "this is not a patch", root=temp_dir)
 
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "a\n"
 
 
@@ -314,9 +374,10 @@ def test_apply_patch_redirect_to_other_file_rejected(temp_dir):
     _put(temp_dir, "a.txt", "a\n")
     patch = _make_patch("other.txt", "a\n", "b\n")
 
-    with pytest.raises(ValueError, match="does not match target"):
-        apply_patch("a.txt", patch, root=temp_dir)
+    result = apply_patch("a.txt", patch, root=temp_dir)
 
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "a\n"
 
 
@@ -324,8 +385,10 @@ def test_apply_patch_escape_redirect_rejected(temp_dir):
     _put(temp_dir, "a.txt", "a\n")
     patch = "--- ../outside.txt\n+++ ../outside.txt\n@@ -1,1 +1,1 @@\n-a\n+b\n"
 
-    with pytest.raises(ValueError, match="does not match target"):
-        apply_patch("a.txt", patch, root=temp_dir)
+    result = apply_patch("a.txt", patch, root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_apply_patch_context_mismatch_rejected(temp_dir):
@@ -335,17 +398,20 @@ def test_apply_patch_context_mismatch_rejected(temp_dir):
     result = apply_patch("a.txt", patch, root=temp_dir)  # structure is valid
     approval.approve_request(result.request_id)
 
-    with pytest.raises(ValueError, match="does not match the file"):
-        apply_patch_approved(result.request_id, root=temp_dir)
+    conflict = apply_patch_approved(result.request_id, root=temp_dir)
 
+    assert conflict.outcome == ContractOutcome.CONFLICT
+    assert conflict.error.code == "MUTATION_CONFLICT"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "line1\nline2\n"
 
 
 def test_apply_patch_requires_existing_file(temp_dir):
     patch = _make_patch("missing.txt", "a\n", "b\n")
 
-    with pytest.raises(FileNotFoundError):
-        apply_patch("missing.txt", patch, root=temp_dir)
+    result = apply_patch("missing.txt", patch, root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_apply_patch_expected_hash_match_succeeds(temp_dir):
@@ -364,10 +430,34 @@ def test_apply_patch_stale_expected_hash_conflict(temp_dir):
     _put(temp_dir, "a.txt", "one\ntwo\n")
     patch = _make_patch("a.txt", "one\ntwo\n", "one\nTWO\n")
 
-    with pytest.raises(MutationConflictError, match="Conflict"):
-        apply_patch("a.txt", patch, expected_hash=_sha("stale"), root=temp_dir)
+    result = apply_patch("a.txt", patch, expected_hash=_sha("stale"), root=temp_dir)
 
+    assert result.outcome == ContractOutcome.CONFLICT
+    assert result.error.code == "MUTATION_CONFLICT"
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+def test_apply_patch_deleted_after_approval_is_conflict_and_consumed(temp_dir):
+    original = "one\ntwo\n"
+    target = _put(temp_dir, "a.txt", original)
+    patch = _make_patch("a.txt", original, "one\nTWO\n")
+    result = apply_patch("a.txt", patch, expected_hash=_sha(original), root=temp_dir)
+    approval.approve_request(result.request_id)
+    target.unlink()
+
+    conflict = apply_patch_approved(result.request_id, root=temp_dir)
+    status = request_status(result.request_id)
+    replay = apply_patch_approved(result.request_id, root=temp_dir)
+
+    assert conflict.outcome == ContractOutcome.CONFLICT
+    assert conflict.error.code == "MUTATION_CONFLICT"
+    assert conflict.approval.status == ApprovalStatus.CONSUMED
+    assert status.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert replay.outcome == ContractOutcome.APPROVAL_CONSUMED
+    assert {result.trace_id, conflict.trace_id, status.trace_id, replay.trace_id} == {
+        result.trace_id
+    }
+    assert not target.exists()
 
 
 def test_apply_patch_append_and_prepend(temp_dir):
@@ -387,16 +477,20 @@ def test_apply_patch_append_and_prepend(temp_dir):
 def test_apply_patch_oversized_rejected(temp_dir):
     _put(temp_dir, "a.txt", "a\n")
 
-    with pytest.raises(ValueError, match="too large"):
-        apply_patch("a.txt", "x" * (MAX_PATCH_CHARS + 1), root=temp_dir)
+    result = apply_patch("a.txt", "x" * (MAX_PATCH_CHARS + 1), root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_apply_patch_symlink_component_rejected(temp_dir, monkeypatch):
     monkeypatch.setattr(Path, "is_symlink", lambda self: self.name == "link")
     patch = _make_patch("a.txt", "a\n", "b\n")
 
-    with pytest.raises(ValueError, match="Symlinks are not allowed"):
-        apply_patch("link/a.txt", patch, root=temp_dir)
+    result = apply_patch("link/a.txt", patch, root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "MUTATION_REFUSED"
 
 
 def test_apply_patch_real_symlink_escape_rejected(temp_dir):
@@ -412,9 +506,10 @@ def test_apply_patch_real_symlink_escape_rejected(temp_dir):
 
     try:
         patch = _make_patch("secret.txt", "a\n", "b\n")
-        with pytest.raises(ValueError, match="[Ss]ymlink"):
-            apply_patch("link/secret.txt", patch, root=temp_dir)
+        result = apply_patch("link/secret.txt", patch, root=temp_dir)
 
+        assert result.outcome == ContractOutcome.REFUSED
+        assert result.error.code == "MUTATION_REFUSED"
         assert (outside / "secret.txt").read_text(encoding="utf-8") == "a\n"
     finally:
         link.unlink()
@@ -493,6 +588,85 @@ def test_approval_cannot_replay(temp_dir):
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "first"
 
 
+def test_concurrent_resume_loser_preserves_trace_and_does_not_execute_twice(
+    temp_dir,
+    monkeypatch,
+):
+    result = write_file("race.txt", "single execution", root=temp_dir)
+    approval.approve_request(result.request_id)
+
+    original_get_request = approval.get_request
+    initial_load_barrier = threading.Barrier(2)
+    thread_state = threading.local()
+
+    def synchronized_get_request(*args, **kwargs):
+        request = original_get_request(*args, **kwargs)
+        if (
+            request is not None
+            and request.status == ApprovalStatus.APPROVED
+            and not getattr(thread_state, "initial_load_complete", False)
+        ):
+            thread_state.initial_load_complete = True
+            initial_load_barrier.wait(timeout=10)
+        return request
+
+    execution_count = 0
+    execution_lock = threading.Lock()
+    original_atomic_write = filesystem_tools._atomic_write_text
+
+    def counted_atomic_write(*args, **kwargs):
+        nonlocal execution_count
+        with execution_lock:
+            execution_count += 1
+        return original_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(approval, "get_request", synchronized_get_request)
+    monkeypatch.setattr(filesystem_tools, "_atomic_write_text", counted_atomic_write)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(write_file_approved, result.request_id, temp_dir)
+            for _ in range(2)
+        ]
+        resumed = [future.result() for future in futures]
+
+    outcomes = [item.outcome for item in resumed]
+    loser = next(
+        item for item in resumed if item.outcome == ContractOutcome.APPROVAL_CONSUMED
+    )
+    assert outcomes.count(ContractOutcome.SUCCEEDED) == 1
+    assert outcomes.count(ContractOutcome.APPROVAL_CONSUMED) == 1
+    assert execution_count == 1
+    assert {item.trace_id for item in resumed} == {result.trace_id}
+    assert loser.approval.status == ApprovalStatus.CONSUMED
+    assert loser.approval.resume_tool == "filesystem.write_file_approved"
+    assert (temp_dir / "race.txt").read_text(encoding="utf-8") == "single execution"
+
+
+def test_consume_at_expiry_preserves_trace_and_approval_metadata(
+    temp_dir,
+    monkeypatch,
+):
+    result = write_file("expiry-race.txt", "blocked", root=temp_dir)
+    approved = approval.approve_request(result.request_id)
+    original_consume_request = approval.consume_request
+
+    def expire_during_consume(request_id):
+        return original_consume_request(request_id, now=approved.expires_at)
+
+    monkeypatch.setattr(approval, "consume_request", expire_during_consume)
+
+    expired = write_file_approved(result.request_id, root=temp_dir)
+
+    assert expired.outcome == ContractOutcome.APPROVAL_EXPIRED
+    assert expired.trace_id == result.trace_id
+    assert expired.approval.request_id == result.request_id
+    assert expired.approval.status == ApprovalStatus.EXPIRED
+    assert expired.approval.resume_tool == "filesystem.write_file_approved"
+    assert expired.executed is False
+    assert not (temp_dir / "expiry-race.txt").exists()
+
+
 @pytest.mark.parametrize(
     "workspace_case",
     ["missing", "none", "wrong-type", "empty", "relative", "mismatch"],
@@ -525,9 +699,10 @@ def test_write_approval_requires_strict_workspace_snapshot(
     )
     approval.approve_request(request.request_id)
 
-    with pytest.raises(ValueError, match="workspace"):
-        write_file_approved(request.request_id, root=temp_dir)
+    refused = write_file_approved(request.request_id, root=temp_dir)
 
+    assert refused.outcome == ContractOutcome.REFUSED
+    assert refused.error.code == "APPROVED_MUTATION_REFUSED"
     assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
     replay = write_file_approved(request.request_id, root=temp_dir)
     assert replay.executed is False
@@ -609,8 +784,9 @@ def test_successful_mutation_audited(temp_dir):
 
 
 def test_failed_mutation_audited(temp_dir):
-    with pytest.raises(ValueError):
-        write_file("../escape.txt", "x", root=temp_dir)
+    result = write_file("../escape.txt", "x", root=temp_dir)
+
+    assert result.outcome == ContractOutcome.REFUSED
 
     event = _last_event()
     assert event["tool"] == "filesystem.write_file"
