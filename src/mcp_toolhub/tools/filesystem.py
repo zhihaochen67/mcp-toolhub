@@ -40,6 +40,13 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
+from mcp_toolhub.contracts import (
+    ContractError,
+    ContractLifecycle,
+    ContractOutcome,
+    make_contract_error,
+    outcome_for_approval_status,
+)
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalRequest, ApprovalStatus
@@ -81,20 +88,19 @@ class ListDirectoryResult(BaseModel):
     entries: list[DirectoryEntry]
 
 
-class WriteFileResult(BaseModel):
+class WriteFileResult(ContractLifecycle):
     path: str
     executed: bool
     created: bool = False
     bytes_written: int = 0
     previous_hash: str | None = None
     new_hash: str | None = None
-    trace_id: str | None = None
     request_id: str | None = None
     approval_status: ApprovalStatus | None = None
     message: str = ""
 
 
-class ApplyPatchResult(BaseModel):
+class ApplyPatchResult(ContractLifecycle):
     path: str
     executed: bool
     changed: bool = False
@@ -104,7 +110,6 @@ class ApplyPatchResult(BaseModel):
     bytes_after: int = 0
     previous_hash: str | None = None
     new_hash: str | None = None
-    trace_id: str | None = None
     request_id: str | None = None
     approval_status: ApprovalStatus | None = None
     message: str = ""
@@ -461,11 +466,10 @@ def _load_and_consume(
 
     if consumed is None:
         current = approval.get_request(request_id)
-        return (
-            None,
-            (current.status if current is not None else ApprovalStatus.EXPIRED),
-            False,
+        authoritative = current or request.model_copy(
+            update={"status": ApprovalStatus.EXPIRED}
         )
+        return authoritative, authoritative.status, False
 
     return consumed, consumed.status, True
 
@@ -473,9 +477,28 @@ def _load_and_consume(
 def _payload_trace_id(request: ApprovalRequest | None) -> str | None:
     if request is None:
         return None
-    payload = request.payload or {}
-    value = payload.get("trace_id")
-    return str(value) if value else None
+    return request.trace_id
+
+
+def _approval_failure_contract(
+    status: ApprovalStatus | None,
+    message: str,
+) -> tuple[ContractOutcome, ContractError]:
+    if status is None:
+        return (
+            ContractOutcome.REFUSED,
+            make_contract_error(
+                "REQUEST_NOT_FOUND", "Approval request is unavailable."
+            ),
+        )
+    return (
+        outcome_for_approval_status(status),
+        make_contract_error(
+            f"APPROVAL_{status.value}",
+            message,
+            retryable=status == ApprovalStatus.PENDING,
+        ),
+    )
 
 
 def _validate_payload(request: ApprovalRequest, kind: str, required: set[str]) -> dict:
@@ -597,7 +620,26 @@ def write_file(
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        raise
+        if isinstance(exc, MutationConflictError):
+            return WriteFileResult(
+                outcome=ContractOutcome.CONFLICT,
+                trace_id=trace_id,
+                error=make_contract_error("MUTATION_CONFLICT", str(exc)),
+                path=path,
+                executed=False,
+                message=str(exc),
+            )
+        return WriteFileResult(
+            outcome=ContractOutcome.REFUSED,
+            trace_id=trace_id,
+            error=make_contract_error(
+                "MUTATION_REFUSED",
+                "File write request was refused by validation.",
+            ),
+            path=path,
+            executed=False,
+            message=str(exc),
+        )
 
     request = approval.create_request(
         kind="file_write",
@@ -607,10 +649,10 @@ def write_file(
             "expected_hash": expected_hash,
             "create_parents": create_parents,
             "workspace_root": str(root),
-            "trace_id": trace_id,
         },
         risk=RiskLevel.MEDIUM,
         risk_reason=WRITE_RISK_REASON,
+        trace_id=trace_id,
     )
 
     audit.record_event(
@@ -627,9 +669,11 @@ def write_file(
     )
 
     return WriteFileResult(
+        outcome=ContractOutcome.APPROVAL_REQUIRED,
+        trace_id=trace_id,
+        approval=request.public_handle(),
         path=path,
         executed=False,
-        trace_id=trace_id,
         request_id=request.request_id,
         approval_status=request.status,
         message=(
@@ -651,6 +695,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
     root = _effective_root(root)
     request, status, consumed_ok = _load_and_consume(request_id)
     trace_id = _payload_trace_id(request)
+    lifecycle_trace_id = trace_id or audit.new_trace_id()
     started = time.monotonic()
 
     if not consumed_ok:
@@ -659,7 +704,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
         )
         status_value = status.value if status else "unknown"
         audit.record_event(
-            trace_id=trace_id,
+            trace_id=lifecycle_trace_id,
             tool=tool,
             action="approval_rejected",
             approval_status=status,
@@ -671,10 +716,16 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
             error=f"Request is {status_value}; cannot execute.",
             error_type="KeyError" if status is None else "ApprovalStateError",
         )
+        outcome, error = _approval_failure_contract(
+            status, f"Request is {status_value}; cannot execute."
+        )
         return WriteFileResult(
+            outcome=outcome,
+            trace_id=lifecycle_trace_id,
+            approval=(request.public_handle() if request is not None else None),
+            error=error,
             path=path,
             executed=False,
-            trace_id=trace_id,
             request_id=request_id,
             approval_status=status,
             message=f"Request is {status_value}; cannot execute.",
@@ -709,7 +760,7 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
 
     except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
-            trace_id=trace_id,
+            trace_id=lifecycle_trace_id,
             tool=tool,
             action="failure",
             risk=RiskLevel.MEDIUM,
@@ -725,10 +776,35 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        raise
+        if isinstance(exc, MutationConflictError):
+            outcome = ContractOutcome.CONFLICT
+            error = make_contract_error("MUTATION_CONFLICT", str(exc))
+        elif isinstance(exc, OSError):
+            outcome = ContractOutcome.FAILED
+            error = make_contract_error(
+                "FILE_WRITE_FAILED",
+                "Approved file write failed.",
+            )
+        else:
+            outcome = ContractOutcome.REFUSED
+            error = make_contract_error(
+                "APPROVED_MUTATION_REFUSED",
+                "Approved file write no longer satisfies its protected snapshot.",
+            )
+        return WriteFileResult(
+            outcome=outcome,
+            trace_id=lifecycle_trace_id,
+            approval=request.public_handle(),
+            error=error,
+            path=str(request.payload.get("path", "")),
+            executed=False,
+            request_id=request_id,
+            approval_status=request.status,
+            message=error.message,
+        )
 
     audit.record_event(
-        trace_id=trace_id,
+        trace_id=lifecycle_trace_id,
         tool=tool,
         action="execute_approved",
         risk=RiskLevel.MEDIUM,
@@ -747,13 +823,15 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
     )
 
     return WriteFileResult(
+        outcome=ContractOutcome.SUCCEEDED,
+        trace_id=lifecycle_trace_id,
+        approval=request.public_handle(),
         path=path,
         executed=True,
         created=created,
         bytes_written=bytes_written,
         previous_hash=previous_hash,
         new_hash=new_hash,
-        trace_id=trace_id,
         request_id=request_id,
         approval_status=request.status,
     )
@@ -824,7 +902,26 @@ def apply_patch(
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        raise
+        if isinstance(exc, MutationConflictError):
+            return ApplyPatchResult(
+                outcome=ContractOutcome.CONFLICT,
+                trace_id=trace_id,
+                error=make_contract_error("MUTATION_CONFLICT", str(exc)),
+                path=path,
+                executed=False,
+                message=str(exc),
+            )
+        return ApplyPatchResult(
+            outcome=ContractOutcome.REFUSED,
+            trace_id=trace_id,
+            error=make_contract_error(
+                "MUTATION_REFUSED",
+                "File patch request was refused by validation.",
+            ),
+            path=path,
+            executed=False,
+            message=str(exc),
+        )
 
     request = approval.create_request(
         kind="file_patch",
@@ -833,10 +930,10 @@ def apply_patch(
             "patch": patch,
             "expected_hash": expected_hash,
             "workspace_root": str(root),
-            "trace_id": trace_id,
         },
         risk=RiskLevel.MEDIUM,
         risk_reason=PATCH_RISK_REASON,
+        trace_id=trace_id,
     )
 
     audit.record_event(
@@ -853,9 +950,11 @@ def apply_patch(
     )
 
     return ApplyPatchResult(
+        outcome=ContractOutcome.APPROVAL_REQUIRED,
+        trace_id=trace_id,
+        approval=request.public_handle(),
         path=path,
         executed=False,
-        trace_id=trace_id,
         request_id=request.request_id,
         approval_status=request.status,
         message=(
@@ -877,6 +976,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
     root = _effective_root(root)
     request, status, consumed_ok = _load_and_consume(request_id)
     trace_id = _payload_trace_id(request)
+    lifecycle_trace_id = trace_id or audit.new_trace_id()
     started = time.monotonic()
 
     if not consumed_ok:
@@ -885,7 +985,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         )
         status_value = status.value if status else "unknown"
         audit.record_event(
-            trace_id=trace_id,
+            trace_id=lifecycle_trace_id,
             tool=tool,
             action="approval_rejected",
             approval_status=status,
@@ -897,15 +997,22 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
             error=f"Request is {status_value}; cannot execute.",
             error_type="KeyError" if status is None else "ApprovalStateError",
         )
+        outcome, error = _approval_failure_contract(
+            status, f"Request is {status_value}; cannot execute."
+        )
         return ApplyPatchResult(
+            outcome=outcome,
+            trace_id=lifecycle_trace_id,
+            approval=(request.public_handle() if request is not None else None),
+            error=error,
             path=path,
             executed=False,
-            trace_id=trace_id,
             request_id=request_id,
             approval_status=status,
             message=f"Request is {status_value}; cannot execute.",
         )
 
+    snapshot_validated = False
     try:
         payload = _validate_payload(
             request, "file_patch", {"path", "patch", "expected_hash"}
@@ -914,13 +1021,14 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         path = str(payload["path"])
         patch = str(payload["patch"])
         expected_hash = payload.get("expected_hash")
+        snapshot_validated = True
 
         target = _resolve_mutation_target(root, path)
 
+        _check_expected_hash(path, target, expected_hash)
+
         if not target.exists():
             raise FileNotFoundError(f"File not found: {path}")
-
-        _check_expected_hash(path, target, expected_hash)
 
         try:
             original_text = target.read_text(encoding="utf-8")
@@ -941,7 +1049,7 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
 
     except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
-            trace_id=trace_id,
+            trace_id=lifecycle_trace_id,
             tool=tool,
             action="failure",
             risk=RiskLevel.MEDIUM,
@@ -958,10 +1066,35 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        raise
+        if isinstance(exc, OSError):
+            outcome = ContractOutcome.FAILED
+            error = make_contract_error(
+                "FILE_PATCH_FAILED",
+                "Approved file patch failed.",
+            )
+        elif snapshot_validated:
+            outcome = ContractOutcome.CONFLICT
+            error = make_contract_error("MUTATION_CONFLICT", str(exc))
+        else:
+            outcome = ContractOutcome.REFUSED
+            error = make_contract_error(
+                "APPROVED_MUTATION_REFUSED",
+                "Approved file patch no longer satisfies its protected snapshot.",
+            )
+        return ApplyPatchResult(
+            outcome=outcome,
+            trace_id=lifecycle_trace_id,
+            approval=request.public_handle(),
+            error=error,
+            path=str(request.payload.get("path", "")),
+            executed=False,
+            request_id=request_id,
+            approval_status=request.status,
+            message=error.message,
+        )
 
     audit.record_event(
-        trace_id=trace_id,
+        trace_id=lifecycle_trace_id,
         tool=tool,
         action="execute_approved",
         risk=RiskLevel.MEDIUM,
@@ -983,6 +1116,9 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
     )
 
     return ApplyPatchResult(
+        outcome=ContractOutcome.SUCCEEDED,
+        trace_id=lifecycle_trace_id,
+        approval=request.public_handle(),
         path=path,
         executed=True,
         changed=changed,
@@ -992,7 +1128,6 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
         bytes_after=bytes_after,
         previous_hash=previous_hash,
         new_hash=new_hash,
-        trace_id=trace_id,
         request_id=request_id,
         approval_status=request.status,
     )

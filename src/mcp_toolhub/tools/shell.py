@@ -4,8 +4,14 @@ from pathlib import Path
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel
 
+from mcp_toolhub.contracts import (
+    ApprovalHandle,
+    ContractLifecycle,
+    ContractOutcome,
+    make_contract_error,
+    outcome_for_approval_status,
+)
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
@@ -29,7 +35,7 @@ MAX_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 20_000
 
 
-class ShellRunResult(BaseModel):
+class ShellRunResult(ContractLifecycle):
     program: str
     args: list[str]
     cwd: str
@@ -95,6 +101,7 @@ def _execute_subprocess(
     policy_metadata: dict[str, object] | None = None,
     request_id: str | None = None,
     approval_status: ApprovalStatus | None = None,
+    approval_handle: ApprovalHandle | None = None,
     message: str = "",
 ) -> ShellRunResult:
     """Execute a structured command with shell=False and return its result.
@@ -145,6 +152,13 @@ def _execute_subprocess(
         )
 
         return ShellRunResult(
+            outcome=ContractOutcome.TIMED_OUT,
+            trace_id=trace_id,
+            approval=approval_handle,
+            error=make_contract_error(
+                "COMMAND_TIMED_OUT",
+                f"Command timed out after {timeout_seconds}s.",
+            ),
             program=program,
             args=args,
             cwd=relative_cwd,
@@ -178,12 +192,24 @@ def _execute_subprocess(
             extra=audit_extra,
         )
 
-        if isinstance(exc, FileNotFoundError):
-            raise ValueError(  # noqa: TRY004 - preserve the public API contract
-                f"Executable not found: {program}"
-            ) from exc
-
-        raise ValueError(f"Failed to start {program}: {exc}") from exc
+        return ShellRunResult(
+            outcome=ContractOutcome.FAILED,
+            trace_id=trace_id,
+            approval=approval_handle,
+            error=make_contract_error(
+                "COMMAND_START_FAILED",
+                "Approved command could not be started.",
+            ),
+            program=program,
+            args=args,
+            cwd=relative_cwd,
+            risk=risk,
+            risk_reason=risk_reason,
+            executed=False,
+            request_id=request_id,
+            approval_status=approval_status,
+            message=message or "Approved command could not be started.",
+        )
 
     duration_ms = _elapsed_ms(started)
     success = completed.returncode == 0
@@ -207,6 +233,19 @@ def _execute_subprocess(
     )
 
     return ShellRunResult(
+        outcome=(
+            ContractOutcome.SUCCEEDED if success else ContractOutcome.COMMAND_FAILED
+        ),
+        trace_id=trace_id,
+        approval=approval_handle,
+        error=(
+            None
+            if success
+            else make_contract_error(
+                "COMMAND_NONZERO_EXIT",
+                f"Command exited with return code {completed.returncode}.",
+            )
+        ),
         program=program,
         args=args,
         cwd=relative_cwd,
@@ -256,6 +295,8 @@ def _execute_intrinsic_low(
     )
 
     return ShellRunResult(
+        outcome=ContractOutcome.SUCCEEDED,
+        trace_id=trace_id,
         program=program,
         args=args,
         cwd=relative_cwd,
@@ -321,7 +362,24 @@ def run_shell(
                 }
             },
         )
-        raise
+        return ShellRunResult(
+            outcome=ContractOutcome.REFUSED,
+            trace_id=trace_id,
+            error=make_contract_error(
+                "WORKING_DIRECTORY_INVALID",
+                str(exc),
+            ),
+            program=program,
+            args=command_args,
+            cwd=cwd,
+            risk=RiskLevel.HIGH,
+            risk_reason=(
+                "Working directory validation failed before executable "
+                "identity resolution."
+            ),
+            executed=False,
+            message=str(exc),
+        )
 
     assessment = assess_shell_command(
         program,
@@ -362,7 +420,21 @@ def run_shell(
             error_type="ExecutableResolutionError",
             extra={"command_policy": policy_metadata},
         )
-        raise
+        return ShellRunResult(
+            outcome=ContractOutcome.REFUSED,
+            trace_id=trace_id,
+            error=make_contract_error(
+                "EXECUTABLE_RESOLUTION_FAILED",
+                str(exc),
+            ),
+            program=program,
+            args=command_args,
+            cwd=relative_cwd,
+            risk=assessment.level,
+            risk_reason=assessment.reason,
+            executed=False,
+            message=str(exc),
+        )
 
     executable_metadata = executable_snapshot.to_payload()
     policy_metadata["approval_executable"] = executable_snapshot.audit_metadata(
@@ -381,6 +453,7 @@ def run_shell(
             "command_policy": policy_metadata,
             "executable_snapshot": executable_metadata,
         },
+        trace_id=trace_id,
     )
 
     audit.record_event(
@@ -399,6 +472,9 @@ def run_shell(
     )
 
     return ShellRunResult(
+        outcome=ContractOutcome.APPROVAL_REQUIRED,
+        trace_id=trace_id,
+        approval=request.public_handle(),
         program=program,
         args=command_args,
         cwd=relative_cwd,
@@ -418,6 +494,7 @@ def run_shell(
 def _rejected_result(
     request_id: str,
     *,
+    trace_id: str,
     program: str = "",
     args: list[str] | None = None,
     cwd: str = ".",
@@ -425,8 +502,23 @@ def _rejected_result(
     risk_reason: str = "",
     status: ApprovalStatus | None,
     message: str,
+    approval_handle: ApprovalHandle | None = None,
+    outcome: ContractOutcome | None = None,
+    error_code: str | None = None,
 ) -> ShellRunResult:
+    if status is None:
+        resolved_outcome = outcome or ContractOutcome.REFUSED
+        resolved_code = error_code or "REQUEST_NOT_FOUND"
+        retryable = False
+    else:
+        resolved_outcome = outcome or outcome_for_approval_status(status)
+        resolved_code = error_code or f"APPROVAL_{status.value}"
+        retryable = status == ApprovalStatus.PENDING
     return ShellRunResult(
+        outcome=resolved_outcome,
+        trace_id=trace_id,
+        approval=approval_handle,
+        error=make_contract_error(resolved_code, message, retryable=retryable),
         program=program,
         args=list(args or []),
         cwd=cwd,
@@ -494,10 +586,13 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             status=None,
             risk_reason="Unknown approval request.",
             message=f"Unknown approval request: {request_id}",
         )
+
+    trace_id = request.trace_id
 
     if request.status != ApprovalStatus.APPROVED:
         audit_rejection(
@@ -510,6 +605,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=request.program,
             args=request.args,
             cwd=request.cwd,
@@ -517,6 +613,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=request.risk_reason,
             status=request.status,
             message=f"Request is {request.status.value}; cannot execute.",
+            approval_handle=request.public_handle(),
         )
 
     if request.kind != "shell":
@@ -532,6 +629,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=request.program,
             args=request.args,
             cwd=request.cwd,
@@ -539,6 +637,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=request.risk_reason,
             status=request.status,
             message=message,
+            approval_handle=request.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="APPROVAL_KIND_MISMATCH",
         )
 
     # Atomically APPROVED -> CONSUMED. Single-use: a second call fails here.
@@ -557,6 +658,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=request.program,
             args=request.args,
             cwd=request.cwd,
@@ -564,6 +666,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=request.risk_reason,
             status=status,
             message=f"Approval could not be consumed (status {status.value}).",
+            approval_handle=(current.public_handle() if current is not None else None),
         )
 
     stored_policy = consumed.payload.get("command_policy")
@@ -585,6 +688,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=consumed.program,
             args=consumed.args,
             cwd=consumed.cwd,
@@ -592,6 +696,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=consumed.risk_reason,
             status=consumed.status,
             message=message,
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="WORKSPACE_IDENTITY_INVALID",
         )
 
     # Re-validate the stored cwd against the workspace (defense in depth).
@@ -609,6 +716,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=consumed.program,
             args=consumed.args,
             cwd=consumed.cwd,
@@ -616,6 +724,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=consumed.risk_reason,
             status=consumed.status,
             message="Stored cwd escapes the workspace; refused.",
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="WORKSPACE_BOUNDARY_VIOLATION",
         )
 
     if not working_directory.is_dir():
@@ -630,6 +741,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=consumed.program,
             args=consumed.args,
             cwd=consumed.cwd,
@@ -637,6 +749,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=consumed.risk_reason,
             status=consumed.status,
             message="Stored cwd is not a directory; refused.",
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="WORKING_DIRECTORY_INVALID",
         )
 
     timeout_seconds = max(1, min(consumed.timeout_seconds, MAX_TIMEOUT_SECONDS))
@@ -658,6 +773,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         )
         return _rejected_result(
             request_id,
+            trace_id=trace_id,
             program=consumed.program,
             args=consumed.args,
             cwd=consumed.cwd,
@@ -665,6 +781,9 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             risk_reason=consumed.risk_reason,
             status=consumed.status,
             message=message,
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="EXECUTABLE_IDENTITY_MISMATCH",
         )
 
     return _execute_subprocess(
@@ -681,6 +800,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         policy_metadata=policy_metadata,
         request_id=request_id,
         approval_status=consumed.status,
+        approval_handle=consumed.public_handle(),
     )
 
 

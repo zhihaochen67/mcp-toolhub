@@ -14,7 +14,9 @@ REQUIRED_WHEEL_PATHS = {
     "mcp_toolhub/admin.py",
     "mcp_toolhub/app.py",
     "mcp_toolhub/cli.py",
+    "mcp_toolhub/contracts.py",
     "mcp_toolhub/security/paths.py",
+    "mcp_toolhub/tools/control.py",
     "mcp_toolhub/tools/filesystem.py",
     "mcp_toolhub/observability/audit.py",
 }

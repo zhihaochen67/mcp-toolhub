@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
 from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
@@ -188,8 +189,31 @@ def test_approved_can_run():
     result = run_approved_shell(request.request_id)
 
     assert result.executed is True
+    assert result.outcome == ContractOutcome.SUCCEEDED
     assert result.returncode == 0
     assert "Python" in result.stdout
+    assert result.approval_status == ApprovalStatus.CONSUMED
+
+
+def test_nonzero_approved_command_is_machine_readable(monkeypatch):
+    request = _create_request()
+    approval.approve_request(request.request_id)
+
+    monkeypatch.setattr(
+        "mcp_toolhub.tools.shell.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            7,
+            stdout="",
+            stderr="failed\n",
+        ),
+    )
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.outcome == ContractOutcome.COMMAND_FAILED
+    assert result.error.code == "COMMAND_NONZERO_EXIT"
+    assert result.returncode == 7
     assert result.approval_status == ApprovalStatus.CONSUMED
 
 
@@ -469,12 +493,10 @@ def test_executable_validation_is_the_final_identity_step(monkeypatch):
 
 
 def test_unresolved_executable_creates_no_approval():
-    with pytest.raises(
-        ValueError,
-        match="could not be resolved at approval creation",
-    ):
-        run_shell("toolhub-command-that-does-not-exist", ["--probe"])
+    result = run_shell("toolhub-command-that-does-not-exist", ["--probe"])
 
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "EXECUTABLE_RESOLUTION_FAILED"
     assert approval.list_requests() == []
 
 
@@ -482,5 +504,6 @@ def test_workspace_path_security_still_works():
     with pytest.raises(ValueError):
         resolve_workspace_path("../escape.txt")
 
-    with pytest.raises(ValueError):
-        run_shell("python", ["--version"], cwd="../")
+    result = run_shell("python", ["--version"], cwd="../")
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "WORKING_DIRECTORY_INVALID"

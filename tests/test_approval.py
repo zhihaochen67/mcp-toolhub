@@ -100,6 +100,82 @@ def test_store_is_persistent_json(isolated_approval_store):
 
     raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
 
-    assert raw["version"] == 1
+    assert raw["version"] == 2
     assert request.request_id in raw["requests"]
     assert raw["requests"][request.request_id]["status"] == "PENDING"
+    assert raw["requests"][request.request_id]["trace_id"] == request.trace_id
+    assert raw["requests"][request.request_id]["resume_tool"] == "shell.run_approved"
+
+
+def test_version_one_store_is_read_with_derived_contract_metadata(
+    isolated_approval_store,
+):
+    request = _create_request(payload={"trace_id": "trc_existing_v1"})
+    raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
+    record = raw["requests"][request.request_id]
+    record.pop("trace_id")
+    record.pop("resume_tool")
+    raw["version"] = 1
+    isolated_approval_store.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = approval.get_request(request.request_id)
+
+    assert loaded.trace_id == "trc_existing_v1"
+    assert loaded.resume_tool == "shell.run_approved"
+
+
+def test_version_one_derived_traces_are_deterministic_and_request_unique(
+    isolated_approval_store,
+):
+    first = _create_request(payload={})
+    raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
+    first_record = raw["requests"][first.request_id]
+    first_record.pop("trace_id")
+    first_record.pop("resume_tool")
+
+    second_id = "req_" + "2" * 32
+    second_record = json.loads(json.dumps(first_record))
+    second_record["request_id"] = second_id
+    raw["version"] = 1
+    raw["requests"] = {
+        first.request_id: first_record,
+        second_id: second_record,
+    }
+    isolated_approval_store.write_text(json.dumps(raw), encoding="utf-8")
+
+    first_trace = approval.get_request(first.request_id).trace_id
+    repeated_trace = approval.get_request(first.request_id).trace_id
+    second_trace = approval.get_request(second_id).trace_id
+
+    assert first_trace == repeated_trace
+    assert first_trace != second_trace
+    assert first_trace != first.request_id
+    assert second_trace != second_id
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        json.dumps({"version": 99, "requests": {}}),
+        json.dumps({"version": 2, "requests": []}),
+    ],
+)
+def test_malformed_or_incompatible_store_is_not_silently_accepted(
+    isolated_approval_store,
+    payload,
+):
+    isolated_approval_store.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(approval.ApprovalStoreError):
+        approval.get_request("req_unknown")
+
+
+def test_stored_resume_tool_cannot_be_tampered_with(isolated_approval_store):
+    request = _create_request()
+    raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
+    raw["requests"][request.request_id]["resume_tool"] = "shell.evil"
+    isolated_approval_store.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(approval.ApprovalStoreError):
+        approval.get_request(request.request_id)
