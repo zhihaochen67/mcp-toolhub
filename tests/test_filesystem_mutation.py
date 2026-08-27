@@ -155,6 +155,26 @@ def test_write_file_absolute_path_rejected(temp_dir):
     assert not outside.exists()
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "C:/Windows/win.ini",
+        "C:\\Windows\\win.ini",
+        "C:Windows\\win.ini",
+        "\\\\server\\share\\file",
+        "//server/share/file",
+        "\\Windows\\win.ini",
+    ],
+)
+def test_workspace_relative_paths_reject_foreign_root_syntax(temp_dir, path):
+    with pytest.raises(ValueError, match="Absolute"):
+        write_file(path, "x", root=temp_dir)
+
+    with pytest.raises(ValueError, match="escapes workspace"):
+        read_file(path, root=temp_dir)
+
+
 def test_write_file_oversized_content_rejected(temp_dir):
     with pytest.raises(ValueError, match="too large"):
         write_file("a.txt", "x" * (MAX_WRITE_BYTES + 1), root=temp_dir)

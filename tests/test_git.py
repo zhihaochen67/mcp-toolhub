@@ -106,8 +106,38 @@ def test_git_diff_path_traversal_rejected(git_repo):
     with pytest.raises(ValueError, match="escapes"):
         git_diff(path="../outside.txt", root=git_repo)
 
+
+def test_git_diff_posix_absolute_path_rejected(git_repo):
     with pytest.raises(ValueError, match="Absolute"):
-        git_diff(path="C:/Windows/win.ini", root=git_repo)
+        git_diff(path="/etc/passwd", root=git_repo)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:/Windows/win.ini",
+        "C:\\Windows\\win.ini",
+        "C:Windows\\win.ini",
+    ],
+    ids=["drive-forward-slash", "drive-backslash", "drive-relative"],
+)
+def test_git_diff_windows_drive_path_rejected(git_repo, path):
+    with pytest.raises(ValueError, match="Absolute"):
+        git_diff(path=path, root=git_repo)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "\\\\server\\share\\file",
+        "//server/share/file",
+        "\\Windows\\win.ini",
+    ],
+    ids=["unc-backslash", "unc-forward-slash", "rooted-backslash"],
+)
+def test_git_diff_windows_unc_or_rooted_path_rejected(git_repo, path):
+    with pytest.raises(ValueError, match="Absolute"):
+        git_diff(path=path, root=git_repo)
 
 
 def test_git_tools_accept_no_arbitrary_arguments():

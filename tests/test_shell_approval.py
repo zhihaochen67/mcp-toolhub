@@ -135,13 +135,24 @@ def test_medium_pytest_creates_pending_request():
     assert stored.args == ["-q"]
 
 
-def test_high_powershell_creates_pending_request():
-    result = run_shell("powershell", ["-Command", "echo hi"])
+def test_high_command_creates_pending_request(high_python_command):
+    program, args = high_python_command
+
+    result = run_shell(program, args)
 
     assert result.executed is False
     assert result.risk == RiskLevel.HIGH
     assert result.approval_status == ApprovalStatus.PENDING
     assert result.request_id is not None
+
+    stored = approval.get_request(result.request_id)
+    assert stored is not None
+    assert stored.program == program
+    assert stored.args == args
+    assert stored.payload["executable_snapshot"]["canonical_path"] == str(
+        Path(sys.executable).resolve()
+    )
+    assert len(stored.payload["executable_snapshot"]["sha256"]) == 64
 
 
 def test_pending_cannot_run():

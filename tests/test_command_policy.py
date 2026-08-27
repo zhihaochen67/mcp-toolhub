@@ -162,6 +162,21 @@ def test_windows_batch_scripts_are_high(temp_dir, script):
 
 
 @pytest.mark.parametrize(
+    "program",
+    ["powershell", "powershell.exe", "pwsh", "pwsh.exe"],
+)
+def test_powershell_names_are_high_without_executable_resolution(temp_dir, program):
+    workspace = (temp_dir / "workspace").resolve()
+    workspace.mkdir()
+
+    decision = _assess(program, ["-Command", "echo hi"], workspace=workspace)
+
+    assert decision.level == RiskLevel.HIGH
+    assert decision.profile is None
+    assert "Shell interpreters" in decision.reason
+
+
+@pytest.mark.parametrize(
     ("args", "expected"),
     [
         (["--version"], RiskLevel.LOW),

@@ -47,7 +47,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from mcp_toolhub.observability import audit
-from mcp_toolhub.security.paths import get_workspace_root
+from mcp_toolhub.security.paths import get_workspace_root, is_portably_rooted_path
 
 GIT_TIMEOUT_SECONDS = 20
 GIT_MAX_OUTPUT_CHARS = 20_000
@@ -112,7 +112,7 @@ def _resolve_repo_path(root: Path, path: str) -> Path:
     repository root (rejecting absolute paths and ``..`` escapes)."""
     candidate = Path(path)
 
-    if candidate.is_absolute():
+    if is_portably_rooted_path(path):
         raise ValueError(f"Absolute paths are not allowed: {path}")
 
     resolved_root = root.resolve()

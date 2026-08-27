@@ -17,6 +17,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -103,3 +104,9 @@ def _git(*args: str, cwd: Path) -> None:
 def run_git():
     """Run a git command inside a test repository (setup helper)."""
     return _git
+
+
+@pytest.fixture
+def high_python_command():
+    """A real cross-platform executable with an intentionally HIGH profile."""
+    return sys.executable, ["-c", "pass"]

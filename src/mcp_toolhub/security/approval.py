@@ -227,7 +227,7 @@ def _store_lock(store_path: Path) -> Iterator[None]:
 
 def _expired(request: ApprovalRequest, now: datetime | None = None) -> bool:
     if request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}:
-        return (now or _now()) > request.expires_at
+        return (now or _now()) >= request.expires_at
     return False
 
 
