@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -78,18 +79,20 @@ def test_consume_is_single_use():
 
 
 def test_expired_request_reported_expired():
-    request = _create_request(ttl_seconds=0)
+    current = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
+    request = _create_request(ttl_seconds=0, now=current)
 
-    fetched = approval.get_request(request.request_id)
+    fetched = approval.get_request(request.request_id, now=current)
 
     assert fetched.status == ApprovalStatus.EXPIRED
 
 
 def test_expired_request_cannot_be_approved():
-    request = _create_request(ttl_seconds=0)
+    current = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
+    request = _create_request(ttl_seconds=0, now=current)
 
     with pytest.raises(ValueError):
-        approval.approve_request(request.request_id)
+        approval.approve_request(request.request_id, now=current)
 
 
 def test_store_is_persistent_json(isolated_approval_store):

@@ -46,6 +46,7 @@ from mcp_toolhub.security.approval import ApprovalRequest, ApprovalStatus
 from mcp_toolhub.security.paths import (
     MAX_FILE_SIZE,
     get_workspace_root,
+    is_portably_rooted_path,
     resolve_path_within,
     validate_workspace_snapshot,
 )
@@ -154,7 +155,7 @@ def _ensure_no_symlink_components(root: Path, path: str) -> None:
     inside the workspace, for mutations."""
     candidate = Path(path)
 
-    if candidate.is_absolute():
+    if is_portably_rooted_path(path):
         raise ValueError(f"Absolute paths are not allowed: {path}")
 
     current = root

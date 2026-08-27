@@ -182,8 +182,10 @@ def test_audit_metadata_remains_bounded():
     assert all(len(item) <= audit.MAX_STRING_CHARS + 32 for item in items)
 
 
-def test_high_approval_creates_audit_record():
-    result = run_shell("powershell", ["-Command", "echo hi"])
+def test_high_approval_creates_audit_record(high_python_command):
+    program, args = high_python_command
+
+    result = run_shell(program, args)
     assert result.executed is False
 
     event = _last_event()

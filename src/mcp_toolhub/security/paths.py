@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from platformdirs import user_state_path
 
@@ -43,6 +43,22 @@ class RuntimeConfiguration:
 
 
 _configuration: RuntimeConfiguration | None = None
+
+
+def is_portably_rooted_path(path: str) -> bool:
+    """Recognize rooted path syntax independently of the current host OS.
+
+    Workspace/repository path parameters are relative API values, so reject
+    POSIX roots, Windows roots/UNC paths, and Windows drive-relative forms
+    such as ``C:foo`` before applying host-native canonical containment.
+    """
+
+    windows_path = PureWindowsPath(path)
+    return PurePosixPath(path).is_absolute() or bool(
+        windows_path.drive or windows_path.root
+    )
+
+
 _configuration_lock = threading.Lock()
 
 
@@ -390,6 +406,9 @@ def resolve_path_within(path: str, root: Path | None = None) -> Path:
     When no explicit internal/test root is supplied, use the immutable
     process-level ToolHub workspace.
     """
+
+    if is_portably_rooted_path(path):
+        raise ValueError(f"Access denied: path escapes workspace: {path}")
 
     effective_root = (root or get_workspace_root()).resolve()
     target = (effective_root / path).resolve()
