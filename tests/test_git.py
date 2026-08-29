@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -164,24 +165,22 @@ def test_git_tools_accept_no_arbitrary_arguments():
     anyio.run(main)
 
 
-def test_git_status_not_a_repo(temp_dir, monkeypatch):
-    # Stop git from discovering the enclosing project repository: git will
-    # not ascend INTO a ceiling directory, so set the ceiling to the parent.
+def test_git_status_does_not_inherit_parent_git_ceiling(temp_dir, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(temp_dir.parent))
 
-    with pytest.raises(ValueError, match="git exited"):
+    with pytest.raises(ValueError, match="escapes ToolHub workspace"):
         git_status(root=temp_dir)
 
     event = audit.read_recent(limit=10)[-1]
     assert event["tool"] == "git.status"
     assert event["action"] == "failure"
-    assert event["error_type"] == "GitError"
+    assert event["error_type"] == "WorkspaceBoundaryViolation"
 
 
-def test_git_diff_not_a_repo(temp_dir, monkeypatch):
+def test_git_diff_does_not_inherit_parent_git_ceiling(temp_dir, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(temp_dir.parent))
 
-    with pytest.raises(ValueError, match="git exited"):
+    with pytest.raises(ValueError, match="escapes ToolHub workspace"):
         git_diff(root=temp_dir)
 
 
@@ -230,12 +229,13 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
         "-c",
         "core.fsmonitor=false",
     ]
-    rev_parse_cmd = ["git", *global_args, "rev-parse", "--show-toplevel"]
+    git_executable = str(Path(shutil.which("git")).resolve())
+    rev_parse_cmd = [git_executable, *global_args, "rev-parse", "--show-toplevel"]
 
     assert len(calls) == 4
     assert calls[0][0] == rev_parse_cmd
     assert calls[1][0] == [
-        "git",
+        git_executable,
         *global_args,
         "status",
         "--porcelain=v1",
@@ -243,7 +243,7 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
     ]
     assert calls[2][0] == rev_parse_cmd
     assert calls[3][0] == [
-        "git",
+        git_executable,
         *global_args,
         "diff",
         "--no-ext-diff",
@@ -260,6 +260,9 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
         assert env["GIT_OPTIONAL_LOCKS"] == "0"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         assert env["GIT_PAGER"] == "cat"
+        assert "PATH" not in env
+        assert "PYTHONPATH" not in env
+        assert "NODE_OPTIONS" not in env
 
 
 def test_git_status_does_not_execute_repo_fsmonitor(git_repo):

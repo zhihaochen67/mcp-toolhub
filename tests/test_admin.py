@@ -12,6 +12,7 @@ from mcp_toolhub import admin
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
 from mcp_toolhub.security.executable_snapshot import fingerprint_executable
+from mcp_toolhub.security.execution_environment import build_execution_environment
 from mcp_toolhub.security.paths import get_workspace_root
 from mcp_toolhub.security.risk import RiskLevel
 
@@ -37,6 +38,7 @@ def _shell_request(
         payload={
             "workspace_root": str(get_workspace_root()),
             "executable_snapshot": snapshot,
+            "execution_environment": build_execution_environment().to_payload(),
         },
     )
 
@@ -58,6 +60,7 @@ def test_shell_identity_is_shown_unambiguously_before_approval(
     ]
     request = _shell_request(executable, args=arguments)
     snapshot = request.payload["executable_snapshot"]
+    environment = request.payload["execution_environment"]
 
     def confirm(prompt):
         displayed = capsys.readouterr().out
@@ -74,6 +77,11 @@ def test_shell_identity_is_shown_unambiguously_before_approval(
             assert f"args[{index}]:" in displayed
             assert encoded in displayed
         assert "identity_scope:       primary executable only" in displayed
+        assert "environment_policy:   v1" in displayed
+        assert environment["sha256"] in displayed
+        assert "execution_environment" not in displayed
+        for value in environment["variables"].values():
+            assert value not in displayed
         assert request.request_id in prompt
         return "APPROVE"
 
@@ -117,6 +125,31 @@ def test_invalid_shell_snapshot_cannot_be_approved(
     captured = capsys.readouterr()
     assert "executable_snapshot:  INVALID" in captured.out
     assert "Invalid executable snapshot" in captured.err
+    assert approval.get_request(request.request_id).status == ApprovalStatus.PENDING
+
+
+def test_invalid_execution_environment_cannot_be_approved(
+    temp_dir,
+    monkeypatch,
+    capsys,
+):
+    executable = temp_dir / "tool.exe"
+    executable.write_bytes(b"approved executable")
+    request = _shell_request(executable)
+    request.payload["execution_environment"] = None
+    store = approval._read_store(approval._default_store_path())
+    store[request.request_id] = request
+    approval._write_store(approval._default_store_path(), store)
+
+    def unexpected_confirmation(_prompt):
+        raise AssertionError("malformed environment must not reach confirmation")
+
+    monkeypatch.setattr("builtins.input", unexpected_confirmation)
+
+    assert admin.main(["approve", request.request_id]) == 1
+    captured = capsys.readouterr()
+    assert "execution_environment: INVALID" in captured.out
+    assert "Invalid execution environment" in captured.err
     assert approval.get_request(request.request_id).status == ApprovalStatus.PENDING
 
 

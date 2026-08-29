@@ -304,6 +304,24 @@ path with `shell=False`. This is a **validated primary executable identity
 immediately before launch**, not a cryptographic guarantee of the exact bytes
 ultimately mapped by the operating system.
 
+### Sanitized child-process environment
+
+External commands do not inherit the ToolHub server process environment.
+ToolHub builds a minimal sanitized environment when the approval request is
+created, stores its versioned snapshot in protected approval state, and
+executes with exactly that snapshot after approval. The snapshot is validated
+and bound by a deterministic digest; legacy or malformed shell approvals that
+lack it cannot execute and require a new request.
+
+On POSIX, the current baseline inherits no environment variables. On Windows,
+only validated absolute `SystemRoot`, `WINDIR`, `TEMP`, and `TMP` values are
+preserved when present. `PATH`, shell profiles, home/configuration locations,
+credentials, and interpreter, module, loader, shell, and Git injection
+variables are excluded. Users should not expect arbitrary profile or `PATH`
+behavior in approved children. Primary executable selection remains absolute,
+fingerprinted, and approval-bound; the sanitized environment is not used to
+select it.
+
 ToolHub guarantees:
 
 - LOW never creates an external subprocess.
@@ -322,7 +340,7 @@ ToolHub does not guarantee:
 - Exact byte identity against a concurrent local filesystem adversary during
   the narrow final check-to-exec race.
 - Identity of DLLs, interpreters, helpers, plugins, configuration files,
-  environment-selected dependencies, or descendant processes.
+  code-selected dependencies, or descendant processes.
 - That approved executable bytes are benign, signed, or from a reputable
   publisher.
 

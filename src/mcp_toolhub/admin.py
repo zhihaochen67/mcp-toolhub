@@ -27,6 +27,9 @@ from mcp_toolhub.security.executable_snapshot import (
     parse_executable_snapshot,
     validate_executable_snapshot,
 )
+from mcp_toolhub.security.execution_environment import (
+    parse_execution_environment_snapshot,
+)
 from mcp_toolhub.security.paths import (
     RuntimeConfigurationError,
     get_workspace_root,
@@ -86,6 +89,22 @@ def _describe_shell(request: ApprovalRequest) -> str:
                 f"  resolved_executable:  {_json_string(str(snapshot.path))}",
                 f"  executable_sha256:    {snapshot.sha256}",
                 f"  executable_size:      {snapshot.size} bytes",
+            ]
+        )
+
+    try:
+        environment = parse_execution_environment_snapshot(
+            request.payload.get("execution_environment")
+        )
+    except (TypeError, ValueError) as exc:
+        lines.append(f"  execution_environment: INVALID ({exc})")
+    else:
+        metadata = environment.audit_metadata()
+        lines.extend(
+            [
+                f"  environment_policy:   v{metadata['policy_version']}",
+                f"  environment_variables:{metadata['variable_count']:>4}",
+                f"  environment_sha256:   {metadata['sha256']}",
             ]
         )
 
@@ -161,6 +180,13 @@ def cmd_approve(args: argparse.Namespace) -> int:
             validate_executable_snapshot(request.payload.get("executable_snapshot"))
         except (TypeError, ValueError) as exc:
             print(f"error: Invalid executable snapshot: {exc}", file=sys.stderr)
+            return 1
+        try:
+            parse_execution_environment_snapshot(
+                request.payload.get("execution_environment")
+            )
+        except (TypeError, ValueError) as exc:
+            print(f"error: Invalid execution environment: {exc}", file=sys.stderr)
             return 1
 
     try:
