@@ -5,7 +5,6 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -322,13 +321,11 @@ def test_shell_cwd_uses_configured_external_workspace(temp_dir, monkeypatch):
     _configure(monkeypatch, temp_dir)
     calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(
-            command, 0, stdout="Python 3.13\n", stderr=""
-        )
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("LOW intrinsic must not launch a contained process")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     result = run_shell("python", ["--version"])
 
@@ -465,14 +462,16 @@ def test_external_git_repository_integration_smoke_flow(git_repo, run_git, monke
 
     shell_calls = []
 
-    def fake_run(command, **kwargs):
-        shell_calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+    def fake_run(*args, **kwargs):
+        shell_calls.append((args, kwargs))
+        raise AssertionError("LOW intrinsic must not launch a contained process")
 
-    # The shell and git modules share Python's subprocess module object, so
-    # scope the shell mock to this one execution before exercising real git.
+    # Scope the LOW intrinsic guard to this execution before exercising real Git.
     with monkeypatch.context() as shell_patch:
-        shell_patch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+        shell_patch.setattr(
+            "mcp_toolhub.tools.shell.run_contained_process",
+            fake_run,
+        )
         shell = run_shell("python", ["--version"])
 
     status = git_status()

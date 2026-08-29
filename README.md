@@ -13,6 +13,7 @@ ToolHub does not expose an HTTP, SSE, or other network listener.
 - Workspace-confined file reading, directory listing, writes, and patches
 - Read-only Git status and diff operations
 - Structured shell commands with deny-by-default risk classification
+- OS-backed process-tree containment for external executions
 - Atomic, expiring, single-use approval requests
 - Versioned, resumable Contract V1 lifecycle results
 - Separate trusted administrator CLI; no MCP self-approval tool
@@ -321,6 +322,29 @@ variables are excluded. Users should not expect arbitrary profile or `PATH`
 behavior in approved children. Primary executable selection remains absolute,
 fingerprinted, and approval-bound; the sanitized environment is not used to
 select it.
+
+### Process-tree containment
+
+Every approved external command executes inside a dedicated OS-backed
+process-tree lifetime boundary. Fixed read-only Git subprocesses use the same
+boundary. On POSIX, ToolHub creates a new session/process group for each
+execution. On Windows, it creates a per-execution Job Object with
+kill-on-job-close enabled, starts the primary process suspended, assigns it to
+the Job Object, and resumes it only after assignment succeeds.
+
+On timeout, ToolHub terminates the contained execution tree rather than only
+the primary process, captures available output with bounded cleanup waits, and
+reaps the launched child. Containment resources are released deterministically
+on success, command failure, timeout, start/setup failure, and internal cleanup
+paths; remaining contained descendants are terminated when an execution is
+cleaned up.
+
+Process-tree containment complements rather than replaces human approval,
+primary-executable identity binding, workspace binding, and the sanitized
+environment policy. It is a process-lifetime boundary, not a full OS sandbox or
+container: it does not add filesystem or network sandboxing, CPU or memory
+resource isolation, kernel-level protection, or safe execution of arbitrary
+hostile code.
 
 ToolHub guarantees:
 

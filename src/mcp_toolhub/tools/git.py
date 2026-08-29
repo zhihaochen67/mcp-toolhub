@@ -49,6 +49,10 @@ from pydantic import BaseModel
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security.execution_environment import build_execution_environment
 from mcp_toolhub.security.paths import get_workspace_root, is_portably_rooted_path
+from mcp_toolhub.security.process_containment import (
+    ProcessContainmentError,
+    run_contained_process,
+)
 
 GIT_TIMEOUT_SECONDS = 20
 GIT_MAX_OUTPUT_CHARS = 20_000
@@ -143,25 +147,35 @@ def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
     ).environment()
 
     try:
-        return subprocess.run(
-            command,
+        result = run_contained_process(
+            str(git_executable),
+            [*_GIT_GLOBAL_ARGS, *argv],
             cwd=root,
             env=environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
-            shell=False,
-            check=False,
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
         )
+    except ProcessContainmentError as exc:
+        raise ValueError(
+            "Git execution could not use the required process-tree containment."
+        ) from exc
     except FileNotFoundError as exc:
         raise ValueError("Git executable not found") from exc
-    except subprocess.TimeoutExpired as exc:
+    except OSError as exc:
+        raise ValueError(
+            "Git execution could not use the required process-tree containment."
+        ) from exc
+    if result.timed_out:
         raise TimeoutError(
             f"git {' '.join(argv)} timed out after {GIT_TIMEOUT_SECONDS}s"
-        ) from exc
+        )
+    if result.returncode is None:
+        raise ValueError("Git execution did not return a process exit status.")
+    return subprocess.CompletedProcess(
+        command,
+        result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
 
 
 def _elapsed_ms(started: float) -> int:

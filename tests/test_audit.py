@@ -24,6 +24,10 @@ from mcp_toolhub.security.paths import (
     get_workspace_root,
     resolve_workspace_path,
 )
+from mcp_toolhub.security.process_containment import (
+    ContainedProcessResult,
+    containment_policy_metadata,
+)
 from mcp_toolhub.security.risk import RiskLevel
 from mcp_toolhub.tools.shell import run_approved_shell, run_shell
 
@@ -55,6 +59,25 @@ def _create_request(**kwargs):
     )
     defaults["payload"] = payload
     return approval.create_request(**defaults)
+
+
+def _contained_result(
+    returncode: int = 0,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+) -> ContainedProcessResult:
+    metadata = containment_policy_metadata()
+    metadata.tree_termination_attempted = timed_out
+    return ContainedProcessResult(
+        returncode,
+        stdout,
+        stderr,
+        timed_out,
+        None,
+        metadata,
+    )
 
 
 def test_low_execution_creates_audit_record():
@@ -133,10 +156,10 @@ def test_approved_execution_keeps_policy_audit_correlation(monkeypatch):
     created = run_shell("git", ["status"])
     approval.approve_request(created.request_id)
 
-    def fake_run(command, **kwargs):
-        return subprocess.CompletedProcess(command, 0, stdout="clean\n", stderr="")
+    def fake_run(*args, **kwargs):
+        return _contained_result(stdout="clean\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
@@ -236,6 +259,12 @@ def test_approved_execution_creates_audit_record():
     assert event["executed"] is True
     assert event["success"] is True
     assert event["returncode"] == 0
+    containment = event["extra"]["containment"]
+    assert containment["policy_version"] == 1
+    assert containment["platform"] in {"windows", "posix"}
+    assert containment["mechanism"] in {"job_object", "session_process_group"}
+    assert "pid" not in json.dumps(containment).lower()
+    assert "handle" not in json.dumps(containment).lower()
 
 
 def test_replay_attempt_audited():
@@ -280,10 +309,10 @@ def test_unknown_request_attempt_audited():
 
 
 def test_timeout_audited(monkeypatch):
-    def fake_run(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+    def fake_run(*args, **kwargs):
+        return _contained_result(timed_out=True)
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     request = _create_request(program="pytest", args=["-q"])
     approval.approve_request(request.request_id)
@@ -301,10 +330,10 @@ def test_timeout_audited(monkeypatch):
 
 
 def test_execution_failure_audited(monkeypatch):
-    def fake_run(cmd, **kwargs):
+    def fake_run(*args, **kwargs):
         raise FileNotFoundError("no such executable")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     request = _create_request(program="pytest", args=["-q"])
     approval.approve_request(request.request_id)
