@@ -17,6 +17,7 @@ from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
+from mcp_toolhub.security.execution_environment import build_execution_environment
 from mcp_toolhub.security.paths import (
     _reset_runtime_configuration_for_tests,
     get_state_root,
@@ -49,6 +50,9 @@ def _create_request(**kwargs):
     )
     payload.setdefault("workspace_root", str(get_workspace_root()))
     payload.setdefault("executable_snapshot", snapshot.to_payload())
+    payload.setdefault(
+        "execution_environment", build_execution_environment().to_payload()
+    )
     defaults["payload"] = payload
     return approval.create_request(**defaults)
 
@@ -93,6 +97,23 @@ def test_medium_approval_creates_audit_record():
     assert event["executed"] is False
     assert event["success"] is True
     assert event["extra"]["command_policy"]["decision"] == "approval_required"
+    environment = event["extra"]["command_policy"]["execution_environment"]
+    assert set(environment) == {"policy_version", "variable_count", "sha256"}
+
+
+def test_audit_records_only_environment_metadata(monkeypatch):
+    sentinel = "TOP-SECRET-CHILD-ENVIRONMENT-63c1"
+    monkeypatch.setenv("TOOLHUB_TEST_SECRET_TOKEN", sentinel)
+
+    result = run_shell("pytest", ["-q"])
+    event = _last_event()
+    raw = (get_state_root() / "audit.jsonl").read_text(encoding="utf-8")
+
+    assert result.outcome == ContractOutcome.APPROVAL_REQUIRED
+    metadata = event["extra"]["command_policy"]["execution_environment"]
+    assert set(metadata) == {"policy_version", "variable_count", "sha256"}
+    assert sentinel not in raw
+    assert "variables" not in metadata
 
 
 def test_generic_git_approval_audit_explains_policy():

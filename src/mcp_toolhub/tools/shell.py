@@ -23,6 +23,10 @@ from mcp_toolhub.security.executable_snapshot import (
     resolve_executable_snapshot,
     validate_executable_snapshot,
 )
+from mcp_toolhub.security.execution_environment import (
+    build_execution_environment,
+    parse_execution_environment_snapshot,
+)
 from mcp_toolhub.security.paths import (
     get_workspace_root,
     relative_workspace_path,
@@ -98,6 +102,7 @@ def _execute_subprocess(
     trace_id: str,
     action: str,
     execution_program: str,
+    execution_environment: dict[str, str],
     policy_metadata: dict[str, object] | None = None,
     request_id: str | None = None,
     approval_status: ApprovalStatus | None = None,
@@ -128,6 +133,7 @@ def _execute_subprocess(
             timeout=timeout_seconds,
             shell=False,
             check=False,
+            env=execution_environment,
         )
 
     except subprocess.TimeoutExpired as exc:
@@ -400,6 +406,8 @@ def run_shell(
             trace_id=trace_id,
         )
 
+    execution_environment = build_execution_environment()
+
     try:
         executable_snapshot = resolve_executable_snapshot(
             program,
@@ -441,6 +449,7 @@ def run_shell(
         requested_program=program,
         workspace_root=get_workspace_root(),
     )
+    policy_metadata["execution_environment"] = execution_environment.audit_metadata()
     request = approval.create_request(
         program=program,
         args=command_args,
@@ -452,6 +461,7 @@ def run_shell(
             "workspace_root": str(get_workspace_root()),
             "command_policy": policy_metadata,
             "executable_snapshot": executable_metadata,
+            "execution_environment": execution_environment.to_payload(),
         },
         trace_id=trace_id,
     )
@@ -701,6 +711,39 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             error_code="WORKSPACE_IDENTITY_INVALID",
         )
 
+    try:
+        execution_environment = parse_execution_environment_snapshot(
+            consumed.payload.get("execution_environment")
+        )
+    except (TypeError, ValueError) as exc:
+        message = (
+            f"Approval execution environment is invalid: {exc} "
+            "A new shell approval request is required."
+        )
+        audit_rejection(
+            status=consumed.status,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            error=message,
+            error_type="ExecutionEnvironmentMismatch",
+        )
+        return _rejected_result(
+            request_id,
+            trace_id=trace_id,
+            program=consumed.program,
+            args=consumed.args,
+            cwd=consumed.cwd,
+            risk=consumed.risk,
+            risk_reason=consumed.risk_reason,
+            status=consumed.status,
+            message=message,
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="EXECUTION_ENVIRONMENT_INVALID",
+        )
+
     # Re-validate the stored cwd against the workspace (defense in depth).
     try:
         working_directory = resolve_workspace_path(consumed.cwd)
@@ -797,6 +840,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         trace_id=trace_id,
         action="execute_approved",
         execution_program=str(execution_program),
+        execution_environment=execution_environment.environment(),
         policy_metadata=policy_metadata,
         request_id=request_id,
         approval_status=consumed.status,

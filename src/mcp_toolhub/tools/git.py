@@ -37,7 +37,7 @@ is addressed at that repository's location.
 
 from __future__ import annotations
 
-import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -47,6 +47,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from mcp_toolhub.observability import audit
+from mcp_toolhub.security.execution_environment import build_execution_environment
 from mcp_toolhub.security.paths import get_workspace_root, is_portably_rooted_path
 
 GIT_TIMEOUT_SECONDS = 20
@@ -128,15 +129,24 @@ def _resolve_repo_path(root: Path, path: str) -> Path:
 
 def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a git subcommand with the hardened read-only posture."""
-    command = ["git", *_GIT_GLOBAL_ARGS, *argv]
-    env = dict(os.environ)
-    env.update(_GIT_ENV_EXTRA)
+    located = shutil.which("git")
+    if located is None:
+        raise ValueError("Git executable not found")
+    try:
+        git_executable = Path(located).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Git executable could not be resolved") from exc
+
+    command = [str(git_executable), *_GIT_GLOBAL_ARGS, *argv]
+    environment = build_execution_environment(
+        additional_variables=_GIT_ENV_EXTRA
+    ).environment()
 
     try:
         return subprocess.run(
             command,
             cwd=root,
-            env=env,
+            env=environment,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -150,7 +160,7 @@ def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
         raise ValueError("Git executable not found") from exc
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(
-            f"git {' '.join(command)} timed out after {GIT_TIMEOUT_SECONDS}s"
+            f"git {' '.join(argv)} timed out after {GIT_TIMEOUT_SECONDS}s"
         ) from exc
 
 

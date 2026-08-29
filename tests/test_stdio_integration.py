@@ -113,6 +113,9 @@ async def _exercise_stdio(
     launch_directory: Path,
 ) -> None:
     environment = _runtime_environment(workspace, state_root)
+    secret_name = "TOOLHUB_TEST_SECRET_TOKEN"
+    secret_value = "installed-wheel-parent-secret-b6d2"
+    environment[secret_name] = secret_value
     marker = "workspace-marker-7d2f0a"
     (workspace / "marker.txt").write_text(marker, encoding="utf-8")
     parameters = StdioServerParameters(
@@ -347,17 +350,32 @@ async def _exercise_stdio(
                         "shell.run",
                         {
                             "program": str(runtime_python),
-                            "args": ["-c", "print('toolhub-shell-ok')"],
+                            "args": [
+                                "-c",
+                                (
+                                    "import os; print('toolhub-shell-ok'); "
+                                    f"print(os.environ.get({secret_name!r}, 'ABSENT'))"
+                                ),
+                            ],
                         },
                     )
                 )
                 assert shell_request["outcome"] == "APPROVAL_REQUIRED"
                 assert shell_request["executed"] is False
+                assert secret_value not in json.dumps(shell_request)
                 request_id = shell_request["request_id"]
                 assert request_id.startswith("req_")
                 shell_trace = shell_request["trace_id"]
                 shell_handle = shell_request["approval"]
                 assert shell_handle["resume_tool"] == "shell.run_approved"
+
+                raw_store = (state_root / "approvals.json").read_text(encoding="utf-8")
+                stored_request = json.loads(raw_store)["requests"][request_id]
+                stored_environment = stored_request["payload"]["execution_environment"]
+                assert stored_environment["policy_version"] == 1
+                assert len(stored_environment["sha256"]) == 64
+                assert secret_name not in stored_environment["variables"]
+                assert secret_value not in raw_store
 
                 code, admin_stdout, admin_stderr = await _admin_command(
                     admin,
@@ -367,6 +385,7 @@ async def _exercise_stdio(
                 )
                 assert code == 0, admin_stderr
                 assert request_id in admin_stdout
+                assert secret_value not in admin_stdout
                 code, _stdout, admin_stderr = await _admin_command(
                     admin,
                     ["approve", request_id],
@@ -383,7 +402,8 @@ async def _exercise_stdio(
                 assert shell_done["outcome"] == "SUCCEEDED"
                 assert shell_done["trace_id"] == shell_trace
                 assert shell_done["returncode"] == 0
-                assert shell_done["stdout"] == "toolhub-shell-ok\n"
+                assert shell_done["stdout"] == "toolhub-shell-ok\nABSENT\n"
+                assert secret_value not in json.dumps(shell_done)
 
 
 def test_stdio_initialize_tools_ping_workspace_and_admin_state(external_runtime_dir):

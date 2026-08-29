@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -17,6 +18,7 @@ from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
 from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
+from mcp_toolhub.security.execution_environment import build_execution_environment
 from mcp_toolhub.security.paths import (
     _reset_runtime_configuration_for_tests,
     get_workspace_root,
@@ -43,6 +45,9 @@ def _create_request(**kwargs):
     )
     payload.setdefault("workspace_root", str(get_workspace_root()))
     payload.setdefault("executable_snapshot", snapshot.to_payload())
+    payload.setdefault(
+        "execution_environment", build_execution_environment().to_payload()
+    )
     defaults["payload"] = payload
     return approval.create_request(**defaults)
 
@@ -68,7 +73,10 @@ def _create_shell_request_with_workspace(
         sys.executable,
         working_directory=get_workspace_root(),
     )
-    payload = {"executable_snapshot": snapshot.to_payload()}
+    payload = {
+        "executable_snapshot": snapshot.to_payload(),
+        "execution_environment": build_execution_environment().to_payload(),
+    }
     if workspace_snapshot is _DEFAULT_WORKSPACE:
         payload["workspace_root"] = str(get_workspace_root())
     elif workspace_snapshot is not None:
@@ -154,6 +162,9 @@ def test_high_command_creates_pending_request(high_python_command):
         Path(sys.executable).resolve()
     )
     assert len(stored.payload["executable_snapshot"]["sha256"]) == 64
+    environment = stored.payload["execution_environment"]
+    assert environment["policy_version"] == 1
+    assert len(environment["sha256"]) == 64
 
 
 def test_pending_cannot_run():
@@ -264,6 +275,7 @@ def test_request_id_cannot_alter_command(monkeypatch):
     assert cmd == [snapshot["canonical_path"], "--version"]
     assert kwargs["shell"] is False
     assert kwargs["cwd"] == get_workspace_root()
+    assert kwargs["env"] == request.payload["execution_environment"]["variables"]
 
 
 def test_path_change_after_approval_does_not_change_executable(
@@ -350,7 +362,10 @@ def test_approved_request_without_executable_snapshot_fails_closed():
         cwd=".",
         risk=RiskLevel.MEDIUM,
         risk_reason="legacy test",
-        payload={"workspace_root": str(get_workspace_root())},
+        payload={
+            "workspace_root": str(get_workspace_root()),
+            "execution_environment": build_execution_environment().to_payload(),
+        },
     )
     approval.approve_request(request.request_id)
 
@@ -359,6 +374,130 @@ def test_approved_request_without_executable_snapshot_fails_closed():
     assert result.executed is False
     assert result.approval_status == ApprovalStatus.CONSUMED
     assert "no executable snapshot" in result.message
+
+
+def test_legacy_shell_approval_without_environment_snapshot_fails_closed():
+    snapshot = resolve_executable_snapshot(
+        sys.executable,
+        working_directory=get_workspace_root(),
+    )
+    request = approval.create_request(
+        program=sys.executable,
+        args=["--version"],
+        cwd=".",
+        risk=RiskLevel.MEDIUM,
+        risk_reason="legacy test",
+        payload={
+            "workspace_root": str(get_workspace_root()),
+            "executable_snapshot": snapshot.to_payload(),
+        },
+    )
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "EXECUTION_ENVIRONMENT_INVALID"
+    assert result.approval_status == ApprovalStatus.CONSUMED
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
+
+
+def test_approved_child_uses_stored_sanitized_environment(monkeypatch):
+    names = [
+        "TOOLHUB_TEST_SECRET_TOKEN",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "BASH_ENV",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "PATH",
+    ]
+    first_secret = "toolhub-parent-secret-before-approval-91a4"
+    second_secret = "toolhub-parent-secret-after-approval-2db7"
+    for name in names:
+        monkeypatch.setenv(name, first_secret)
+
+    probe = (
+        "import json, os; "
+        f"names = {names!r}; "
+        "print(json.dumps({name: os.environ.get(name) for name in names}, "
+        "sort_keys=True))"
+    )
+    created = run_shell(sys.executable, ["-c", probe])
+    stored = approval.get_request(created.request_id)
+    stored_environment = stored.payload["execution_environment"]["variables"]
+
+    assert first_secret not in created.model_dump_json()
+    assert first_secret not in json.dumps(stored_environment)
+
+    approval.approve_request(created.request_id)
+    for name in names:
+        monkeypatch.setenv(name, second_secret)
+
+    result = run_approved_shell(created.request_id)
+    observed = json.loads(result.stdout)
+
+    assert result.outcome == ContractOutcome.SUCCEEDED
+    assert observed == {name: None for name in names}
+    assert first_secret not in result.model_dump_json()
+    assert second_secret not in result.model_dump_json()
+
+
+def test_resume_passes_exact_approved_environment_after_parent_changes(monkeypatch):
+    request = _create_request()
+    approved_environment = request.payload["execution_environment"]["variables"]
+    approval.approve_request(request.request_id)
+    monkeypatch.setenv("TEMP", r"C:\changed-after-approval")
+    monkeypatch.setenv("TOOLHUB_TEST_SECRET_TOKEN", "new-parent-secret")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is True
+    assert calls[0][1]["env"] == approved_environment
+    assert "TOOLHUB_TEST_SECRET_TOKEN" not in calls[0][1]["env"]
+
+
+@pytest.mark.parametrize(
+    "malformed_environment",
+    [
+        None,
+        {},
+        {
+            "policy_version": 1,
+            "platform": "posix" if os.name != "nt" else "windows",
+            "variables": {"PATH": "unapproved"},
+            "sha256": "0" * 64,
+        },
+    ],
+    ids=["missing", "missing-schema", "non-allowlisted"],
+)
+def test_malformed_environment_snapshot_fails_after_consumption(
+    malformed_environment,
+):
+    request = _create_request(payload={"execution_environment": malformed_environment})
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.executed is False
+    assert result.outcome == ContractOutcome.REFUSED
+    assert result.error.code == "EXECUTION_ENVIRONMENT_INVALID"
+    assert result.approval_status == ApprovalStatus.CONSUMED
+    assert approval.get_request(request.request_id).status == ApprovalStatus.CONSUMED
 
 
 @pytest.mark.parametrize(
