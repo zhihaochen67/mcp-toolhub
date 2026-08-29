@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import secrets
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import anyio
@@ -103,6 +105,36 @@ def _json_result(result) -> dict:
     assert result.is_error is False
     assert result.structured_content is not None
     return result.structured_content
+
+
+def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x00100000 | 0x00001000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 async def _exercise_stdio(
@@ -404,6 +436,52 @@ async def _exercise_stdio(
                 assert shell_done["returncode"] == 0
                 assert shell_done["stdout"] == "toolhub-shell-ok\nABSENT\n"
                 assert secret_value not in json.dumps(shell_done)
+
+                child_pid_file = workspace / "timed-out-child.pid"
+                child_code = "import time; time.sleep(60)"
+                parent_code = (
+                    "import subprocess,sys,time; from pathlib import Path; "
+                    f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+                    "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+                    "Path(sys.argv[1]).write_text(str(p.pid),encoding='ascii'); "
+                    "print('child-ready',flush=True); time.sleep(60)"
+                )
+                timeout_request = _json_result(
+                    await session.call_tool(
+                        "shell.run",
+                        {
+                            "program": str(runtime_python),
+                            "args": ["-c", parent_code, str(child_pid_file)],
+                            "timeout_seconds": 1,
+                        },
+                    )
+                )
+                assert timeout_request["outcome"] == "APPROVAL_REQUIRED"
+                timeout_id = timeout_request["request_id"]
+                code, _stdout, admin_stderr = await _admin_command(
+                    admin,
+                    ["approve", timeout_id],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                    confirmation=True,
+                )
+                assert code == 0, admin_stderr
+                timeout_done = _json_result(
+                    await session.call_tool(
+                        "shell.run_approved",
+                        {"request_id": timeout_id},
+                    )
+                )
+                assert timeout_done["outcome"] == "TIMED_OUT"
+                assert timeout_done["error"]["code"] == "COMMAND_TIMED_OUT"
+                assert timeout_done["executed"] is True
+                assert timeout_done["timed_out"] is True
+                assert "child-ready" in timeout_done["stdout"]
+                child_pid = int(child_pid_file.read_text(encoding="ascii"))
+                deadline = time.monotonic() + 5
+                while _process_exists(child_pid) and time.monotonic() < deadline:
+                    await anyio.sleep(0.01)
+                assert not _process_exists(child_pid)
 
 
 def test_stdio_initialize_tools_ping_workspace_and_admin_state(external_runtime_dir):

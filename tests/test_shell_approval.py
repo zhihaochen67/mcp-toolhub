@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +22,10 @@ from mcp_toolhub.security.paths import (
     _reset_runtime_configuration_for_tests,
     get_workspace_root,
     resolve_workspace_path,
+)
+from mcp_toolhub.security.process_containment import (
+    ContainedProcessResult,
+    containment_policy_metadata,
 )
 from mcp_toolhub.security.risk import RiskLevel
 from mcp_toolhub.tools.shell import run_approved_shell, run_shell
@@ -59,6 +62,25 @@ def _make_executable(directory: Path, stem: str, content: str) -> Path:
     path.write_text(content, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path.resolve()
+
+
+def _contained_result(
+    returncode: int = 0,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+) -> ContainedProcessResult:
+    metadata = containment_policy_metadata()
+    metadata.tree_termination_attempted = timed_out
+    return ContainedProcessResult(
+        returncode,
+        stdout,
+        stderr,
+        timed_out,
+        None,
+        metadata,
+    )
 
 
 _DEFAULT_WORKSPACE = object()
@@ -105,11 +127,11 @@ def test_low_python_version_executes():
 def test_low_execution_does_not_start_a_subprocess(monkeypatch):
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout="Python 3.13.11\n", stderr="")
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _contained_result(stdout="Python 3.13.11\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     result = run_shell("python", ["--version"])
 
@@ -211,13 +233,8 @@ def test_nonzero_approved_command_is_machine_readable(monkeypatch):
     approval.approve_request(request.request_id)
 
     monkeypatch.setattr(
-        "mcp_toolhub.tools.shell.subprocess.run",
-        lambda command, **kwargs: subprocess.CompletedProcess(
-            command,
-            7,
-            stdout="",
-            stderr="failed\n",
-        ),
+        "mcp_toolhub.tools.shell.run_contained_process",
+        lambda *args, **kwargs: _contained_result(7, stderr="failed\n"),
     )
 
     result = run_approved_shell(request.request_id)
@@ -225,6 +242,43 @@ def test_nonzero_approved_command_is_machine_readable(monkeypatch):
     assert result.outcome == ContractOutcome.COMMAND_FAILED
     assert result.error.code == "COMMAND_NONZERO_EXIT"
     assert result.returncode == 7
+    assert result.approval_status == ApprovalStatus.CONSUMED
+
+
+def test_approved_timeout_remains_machine_readable():
+    request = _create_request(
+        program=sys.executable,
+        args=["-c", "import time; print('ready',flush=True); time.sleep(60)"],
+        timeout_seconds=1,
+    )
+    approval.approve_request(request.request_id)
+
+    result = run_approved_shell(request.request_id)
+
+    assert result.outcome == ContractOutcome.TIMED_OUT
+    assert result.error.code == "COMMAND_TIMED_OUT"
+    assert result.executed is True
+    assert result.timed_out is True
+    assert "ready" in result.stdout
+    assert result.approval_status == ApprovalStatus.CONSUMED
+
+
+def test_approved_start_failure_remains_failed(monkeypatch):
+    request = _create_request()
+    approval.approve_request(request.request_id)
+
+    def fail_start(*args, **kwargs):
+        raise FileNotFoundError("simulated launch failure")
+
+    monkeypatch.setattr(
+        "mcp_toolhub.tools.shell.run_contained_process",
+        fail_start,
+    )
+    result = run_approved_shell(request.request_id)
+
+    assert result.outcome == ContractOutcome.FAILED
+    assert result.error.code == "COMMAND_START_FAILED"
+    assert result.executed is False
     assert result.approval_status == ApprovalStatus.CONSUMED
 
 
@@ -259,23 +313,24 @@ def test_request_id_cannot_alter_command(monkeypatch):
 
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout="Python 3.13.11\n", stderr="")
+    def fake_run(executable, args, **kwargs):
+        calls.append((executable, args, kwargs))
+        return _contained_result(stdout="Python 3.13.11\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     result = run_approved_shell(request.request_id)
 
     assert result.executed is True
     assert len(calls) == 1
 
-    cmd, kwargs = calls[0]
+    executable, called_args, kwargs = calls[0]
     snapshot = request.payload["executable_snapshot"]
-    assert cmd == [snapshot["canonical_path"], "--version"]
-    assert kwargs["shell"] is False
+    assert executable == snapshot["canonical_path"]
+    assert called_args == ["--version"]
     assert kwargs["cwd"] == get_workspace_root()
     assert kwargs["env"] == request.payload["execution_environment"]["variables"]
+    assert kwargs["timeout_seconds"] == request.timeout_seconds
 
 
 def test_path_change_after_approval_does_not_change_executable(
@@ -296,16 +351,16 @@ def test_path_change_after_approval_does_not_change_executable(
 
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout="first\n", stderr="")
+    def fake_run(executable, args, **kwargs):
+        calls.append((executable, args, kwargs))
+        return _contained_result(stdout="first\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
-    assert calls[0][0][0] == str(first)
-    assert calls[0][0][0] != str(second)
+    assert calls[0][0] == str(first)
+    assert calls[0][0] != str(second)
 
 
 def test_workspace_local_executable_runs_approved_identity(
@@ -320,16 +375,17 @@ def test_workspace_local_executable_runs_approved_identity(
 
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+    def fake_run(executable, args, **kwargs):
+        calls.append((executable, args, kwargs))
+        return _contained_result(stdout="ok\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
     result = run_approved_shell(created.request_id)
 
     assert result.executed is True
-    assert calls[0][0] == [str(executable), "--probe"]
-    assert calls[0][1]["cwd"] == temp_dir
+    assert calls[0][0] == str(executable)
+    assert calls[0][1] == ["--probe"]
+    assert calls[0][2]["cwd"] == temp_dir
 
 
 def test_executable_replacement_after_approval_fails_closed(
@@ -343,7 +399,7 @@ def test_executable_replacement_after_approval_fails_closed(
 
     calls = []
     monkeypatch.setattr(
-        "mcp_toolhub.tools.shell.subprocess.run",
+        "mcp_toolhub.tools.shell.run_contained_process",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
@@ -458,17 +514,17 @@ def test_resume_passes_exact_approved_environment_after_parent_changes(monkeypat
     monkeypatch.setenv("TOOLHUB_TEST_SECRET_TOKEN", "new-parent-secret")
     calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+    def fake_run(executable, args, **kwargs):
+        calls.append((executable, args, kwargs))
+        return _contained_result(stdout="ok\n")
 
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     result = run_approved_shell(request.request_id)
 
     assert result.executed is True
-    assert calls[0][1]["env"] == approved_environment
-    assert "TOOLHUB_TEST_SECRET_TOKEN" not in calls[0][1]["env"]
+    assert calls[0][2]["env"] == approved_environment
+    assert "TOOLHUB_TEST_SECRET_TOKEN" not in calls[0][2]["env"]
 
 
 @pytest.mark.parametrize(
@@ -587,13 +643,13 @@ def test_concurrent_replay_allows_at_most_one_execution(monkeypatch):
         barrier.wait(timeout=5)
         return original_consume(request_id)
 
-    def fake_run(command, **kwargs):
+    def fake_run(executable, args, **kwargs):
         with execution_lock:
-            executions.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+            executions.append([executable, *args])
+        return _contained_result(stdout="ok\n")
 
     monkeypatch.setattr(approval, "consume_request", synchronized_consume)
-    monkeypatch.setattr("mcp_toolhub.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("mcp_toolhub.tools.shell.run_contained_process", fake_run)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(
@@ -618,12 +674,12 @@ def test_executable_validation_is_the_final_identity_step(monkeypatch):
         order.append("validate")
         return original_validate(payload)
 
-    def fake_run(command, **kwargs):
+    def fake_run(executable, args, **kwargs):
         order.append("launch")
-        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+        return _contained_result(stdout="ok\n")
 
     monkeypatch.setattr(shell_module, "validate_executable_snapshot", track_validation)
-    monkeypatch.setattr(shell_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(shell_module, "run_contained_process", fake_run)
 
     result = run_approved_shell(request.request_id)
 

@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from mcp_toolhub.observability import audit
+from mcp_toolhub.security.execution_environment import build_execution_environment
+from mcp_toolhub.security.process_containment import (
+    ContainedProcessResult,
+    containment_policy_metadata,
+    run_contained_process,
+)
 from mcp_toolhub.tools.git import GIT_TIMEOUT_SECONDS, git_diff, git_status
 
 
@@ -36,6 +45,36 @@ def _raw_status(repo):
         text=True,
         check=True,
     ).stdout
+
+
+def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x00100000 | 0x00001000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _rmtree_readonly(path):
@@ -210,15 +249,23 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
 
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        if "rev-parse" in cmd:
+    def fake_run(executable, args, **kwargs):
+        command = [executable, *args]
+        calls.append((command, kwargs))
+        if "rev-parse" in command:
             stdout = f"{git_repo}\n"
         else:
             stdout = ""
-        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        return ContainedProcessResult(
+            0,
+            stdout,
+            "",
+            False,
+            None,
+            containment_policy_metadata(),
+        )
 
-    monkeypatch.setattr(git_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_tools, "run_contained_process", fake_run)
 
     git_status(root=git_repo)
     git_diff(root=git_repo)
@@ -251,10 +298,8 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
     ]
 
     for _, kwargs in calls:
-        assert kwargs["shell"] is False
         assert kwargs["cwd"] == git_repo
-        assert kwargs["timeout"] == GIT_TIMEOUT_SECONDS
-        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["timeout_seconds"] == GIT_TIMEOUT_SECONDS
 
         env = kwargs["env"]
         assert env["GIT_OPTIONAL_LOCKS"] == "0"
@@ -263,6 +308,42 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
         assert "PATH" not in env
         assert "PYTHONPATH" not in env
         assert "NODE_OPTIONS" not in env
+
+
+def test_git_timeout_terminates_controlled_helper_child(monkeypatch, git_repo):
+    from mcp_toolhub.tools import git as git_tools
+
+    pid_file = git_repo / "git-helper-child.pid"
+    child = "import time; time.sleep(60)"
+    parent = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child!r}],"
+        "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+        "Path(sys.argv[1]).write_text(str(p.pid),encoding='ascii'); "
+        "print('git-helper-ready',flush=True); time.sleep(60)"
+    )
+
+    def controlled_timeout(*args, **kwargs):
+        return run_contained_process(
+            sys.executable,
+            ["-c", parent, str(pid_file)],
+            cwd=git_repo,
+            env=build_execution_environment().environment(),
+            timeout_seconds=0.75,
+        )
+
+    monkeypatch.setattr(git_tools, "run_contained_process", controlled_timeout)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        git_tools._run_git(git_repo, ["status", "--porcelain=v1"])
+
+    pid = int(pid_file.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 3
+    while _process_exists(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not _process_exists(pid), (
+        "Contained Git helper child remained alive after timeout."
+    )
 
 
 def test_git_status_does_not_execute_repo_fsmonitor(git_repo):

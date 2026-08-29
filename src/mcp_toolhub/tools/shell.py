@@ -1,4 +1,3 @@
-import subprocess
 import time
 from pathlib import Path
 
@@ -32,6 +31,11 @@ from mcp_toolhub.security.paths import (
     relative_workspace_path,
     resolve_workspace_path,
     validate_workspace_snapshot,
+)
+from mcp_toolhub.security.process_containment import (
+    ProcessContainmentError,
+    containment_policy_metadata,
+    run_contained_process,
 )
 from mcp_toolhub.security.risk import RiskLevel
 
@@ -76,16 +80,6 @@ def _truncate_output(value: str) -> str:
     return value[:MAX_OUTPUT_CHARS] + f"\n\n[ToolHub truncated {remaining} characters]"
 
 
-def _to_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-
-    return value
-
-
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
@@ -116,71 +110,70 @@ def _execute_subprocess(
     """
     relative_cwd = relative_workspace_path(working_directory)
     arguments = {"program": program, "args": args}
-    audit_extra = (
-        {"command_policy": policy_metadata} if policy_metadata is not None else None
-    )
     started = time.monotonic()
 
     try:
-        completed = subprocess.run(
-            [execution_program, *args],
+        completed = run_contained_process(
+            execution_program,
+            args,
             cwd=working_directory,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            shell=False,
-            check=False,
             env=execution_environment,
+            timeout_seconds=timeout_seconds,
         )
 
-    except subprocess.TimeoutExpired as exc:
+    except ProcessContainmentError as exc:
         duration_ms = _elapsed_ms(started)
+        audit_extra: dict[str, object] = {
+            "containment": exc.containment.audit_metadata()
+        }
+        if policy_metadata is not None:
+            audit_extra["command_policy"] = policy_metadata
         audit.record_event(
             trace_id=trace_id,
             tool=tool,
-            action="timeout",
+            action="failure",
             risk=risk,
             approval_status=approval_status,
             request_id=request_id,
-            executed=True,
+            executed=exc.launched,
             success=False,
             duration_ms=duration_ms,
             arguments=arguments,
             cwd=relative_cwd,
-            error=f"Command timed out after {timeout_seconds}s",
+            error=str(exc),
             error_type=type(exc).__name__,
-            stdout_chars=len(_to_text(exc.stdout)),
-            stderr_chars=len(_to_text(exc.stderr)),
             extra=audit_extra,
         )
 
         return ShellRunResult(
-            outcome=ContractOutcome.TIMED_OUT,
+            outcome=ContractOutcome.FAILED,
             trace_id=trace_id,
             approval=approval_handle,
             error=make_contract_error(
-                "COMMAND_TIMED_OUT",
-                f"Command timed out after {timeout_seconds}s.",
+                "COMMAND_CONTAINMENT_FAILED",
+                "Approved command could not be executed inside the required "
+                "process-tree containment boundary.",
             ),
             program=program,
             args=args,
             cwd=relative_cwd,
             risk=risk,
             risk_reason=risk_reason,
-            executed=True,
-            stdout=_truncate_output(_to_text(exc.stdout)),
-            stderr=_truncate_output(_to_text(exc.stderr)),
-            timed_out=True,
+            executed=exc.launched,
             request_id=request_id,
             approval_status=approval_status,
-            message=message,
+            message=(
+                message
+                or "Approved command could not be executed inside the required "
+                "process-tree containment boundary."
+            ),
         )
 
     except OSError as exc:
         duration_ms = _elapsed_ms(started)
+        audit_extra = {"containment": containment_policy_metadata().audit_metadata()}
+        if policy_metadata is not None:
+            audit_extra["command_policy"] = policy_metadata
         audit.record_event(
             trace_id=trace_id,
             tool=tool,
@@ -215,6 +208,56 @@ def _execute_subprocess(
             request_id=request_id,
             approval_status=approval_status,
             message=message or "Approved command could not be started.",
+        )
+
+    audit_extra = {"containment": completed.containment.audit_metadata()}
+    if policy_metadata is not None:
+        audit_extra["command_policy"] = policy_metadata
+
+    if completed.timed_out:
+        duration_ms = _elapsed_ms(started)
+        timeout_error = f"Command timed out after {timeout_seconds}s"
+        if completed.cleanup_error:
+            timeout_error += "; contained tree cleanup could not be confirmed"
+        audit.record_event(
+            trace_id=trace_id,
+            tool=tool,
+            action="timeout",
+            risk=risk,
+            approval_status=approval_status,
+            request_id=request_id,
+            executed=True,
+            success=False,
+            duration_ms=duration_ms,
+            arguments=arguments,
+            cwd=relative_cwd,
+            error=timeout_error,
+            error_type="TimeoutExpired",
+            stdout_chars=len(completed.stdout),
+            stderr_chars=len(completed.stderr),
+            extra=audit_extra,
+        )
+
+        error_message = f"Command timed out after {timeout_seconds}s."
+        if completed.cleanup_error:
+            error_message += " Contained process-tree cleanup could not be confirmed."
+        return ShellRunResult(
+            outcome=ContractOutcome.TIMED_OUT,
+            trace_id=trace_id,
+            approval=approval_handle,
+            error=make_contract_error("COMMAND_TIMED_OUT", error_message),
+            program=program,
+            args=args,
+            cwd=relative_cwd,
+            risk=risk,
+            risk_reason=risk_reason,
+            executed=True,
+            stdout=_truncate_output(completed.stdout),
+            stderr=_truncate_output(completed.stderr),
+            timed_out=True,
+            request_id=request_id,
+            approval_status=approval_status,
+            message=message,
         )
 
     duration_ms = _elapsed_ms(started)
