@@ -19,22 +19,38 @@ Security / privacy properties
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import secrets
 import threading
+import time
+from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from mcp_toolhub.security.paths import get_state_root
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 MAX_STRING_CHARS = 200
 MAX_COLLECTION_ITEMS = 20
 MAX_ERROR_CHARS = 500
 MAX_READ_EVENTS = 100
 MAX_READ_BYTES = 1_000_000
+MAX_COMPACTION_EVENTS = 100_000
+MAX_COMPACTION_LINE_BYTES = 1_000_000
+
+AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
+_AUDIT_LOCK_RETRY_SECONDS = 0.05
 
 _SENSITIVE_NAME = re.compile(
     r"(password|passwd|pwd|token|secret|api[-_.]?key|credential"
@@ -52,6 +68,28 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 _write_lock = threading.Lock()
 
 
+class AuditMaintenanceError(RuntimeError):
+    """The audit log cannot be compacted without risking data loss."""
+
+
+@dataclass(frozen=True)
+class AuditCompactionResult:
+    """Aggregate-only result for trusted audit maintenance."""
+
+    apply_requested: bool
+    changed: bool
+    total: int
+    retained: int
+    removed: int
+
+
+@dataclass(frozen=True)
+class _AuditScan:
+    total: int
+    retained: int
+    retained_offset: int
+
+
 def new_trace_id() -> str:
     """Return a new unpredictable, unique trace ID."""
     return "trc_" + secrets.token_hex(16)
@@ -63,6 +101,66 @@ def _now_iso() -> str:
 
 def _default_audit_path() -> Path:
     return get_state_root() / "audit.jsonl"
+
+
+@contextmanager
+def _audit_file_lock(audit_path: Path) -> Iterator[None]:
+    """Hold an OS-backed cross-process lock for one audit critical section."""
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = audit_path.with_name(audit_path.name + ".lock")
+    # Keep this sidecar stable: unlinking or replacing it could let contenders
+    # lock different underlying files and both enter the critical section.
+    deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(lock_path, open_flags, 0o600)
+    locked = False
+
+    try:
+        while True:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError as exc:
+                contention = exc.errno in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EDEADLK,
+                } or getattr(exc, "winerror", None) in {33, 36}
+                if not contention:
+                    raise
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Audit log lock acquisition timed out.") from exc
+                time.sleep(min(_AUDIT_LOCK_RETRY_SECONDS, remaining))
+
+        yield
+    finally:
+        if locked:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _audit_write_lock(audit_path: Path) -> Iterator[None]:
+    """Serialize audit append/rewrite operations within and across processes."""
+    with _write_lock, _audit_file_lock(audit_path):
+        yield
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -247,7 +345,7 @@ def record_event(
 
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-        with _write_lock, open(path, "a", encoding="utf-8") as handle:
+        with _audit_write_lock(path), open(path, "a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
 
@@ -256,6 +354,139 @@ def record_event(
     except Exception:  # noqa: BLE001 - audit is a non-fatal boundary
         # Defensive: audit must never break tool execution.
         return False
+
+
+def _scan_for_compaction(
+    path: Path,
+    keep_last: int,
+) -> _AuditScan:
+    """Validate the complete JSONL file and locate the retained byte suffix."""
+    if not path.exists():
+        return _AuditScan(total=0, retained=0, retained_offset=0)
+
+    offsets: deque[int] = deque(maxlen=max(1, keep_last))
+    total = 0
+    position = 0
+
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                line = handle.readline(MAX_COMPACTION_LINE_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > MAX_COMPACTION_LINE_BYTES:
+                    raise AuditMaintenanceError(
+                        "Audit log contains an oversized or incomplete event."
+                    )
+                if not line.endswith(b"\n") or not line.strip():
+                    raise AuditMaintenanceError(
+                        "Audit log contains an incomplete or empty event."
+                    )
+                try:
+                    event = json.loads(line)
+                except (
+                    json.JSONDecodeError,
+                    RecursionError,
+                    UnicodeDecodeError,
+                ) as exc:
+                    raise AuditMaintenanceError(
+                        "Audit log contains malformed JSON."
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise AuditMaintenanceError(
+                        "Audit log contains a non-object event."
+                    )
+
+                if keep_last:
+                    offsets.append(position)
+                position += len(line)
+                total += 1
+    except AuditMaintenanceError:
+        raise
+    except OSError as exc:
+        raise AuditMaintenanceError("Audit log could not be read safely.") from exc
+
+    retained = min(total, keep_last)
+    retained_offset = offsets[0] if offsets else position
+    return _AuditScan(
+        total=total,
+        retained=retained,
+        retained_offset=retained_offset,
+    )
+
+
+def _write_compacted_audit(
+    path: Path,
+    retained_offset: int,
+) -> None:
+    """Atomically replace the log with its exact retained byte suffix."""
+    temporary = path.parent / f".audit-{secrets.token_hex(8)}.tmp"
+
+    try:
+        with open(path, "rb") as source, open(temporary, "xb") as destination:
+            source.seek(retained_offset)
+            while chunk := source.read(1024 * 1024):
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def compact_audit(
+    keep_last: int,
+    *,
+    apply: bool = False,
+    audit_path: Path | None = None,
+) -> AuditCompactionResult:
+    """Plan or atomically retain only the newest complete audit events.
+
+    Apply mode scans and rewrites while holding the same cross-process lock as
+    normal appends. A malformed or incomplete line aborts before replacement.
+    """
+    if isinstance(keep_last, bool) or not isinstance(keep_last, int):
+        raise TypeError("keep_last must be an integer")
+    if not 0 <= keep_last <= MAX_COMPACTION_EVENTS:
+        raise ValueError(f"keep_last must be between 0 and {MAX_COMPACTION_EVENTS}")
+
+    path = audit_path or _default_audit_path()
+
+    def evaluate() -> AuditCompactionResult:
+        scan = _scan_for_compaction(path, keep_last)
+        removed = scan.total - scan.retained
+        changed = apply and removed > 0
+        if changed:
+            try:
+                _write_compacted_audit(path, scan.retained_offset)
+            except OSError as exc:
+                raise AuditMaintenanceError(
+                    "Audit log could not be replaced safely."
+                ) from exc
+        return AuditCompactionResult(
+            apply_requested=apply,
+            changed=changed,
+            total=scan.total,
+            retained=scan.retained,
+            removed=removed,
+        )
+
+    if not apply:
+        return evaluate()
+
+    try:
+        with _audit_write_lock(path):
+            return evaluate()
+    except AuditMaintenanceError:
+        raise
+    except OSError as exc:
+        raise AuditMaintenanceError(
+            "Audit compaction could not acquire the audit lock."
+        ) from exc
 
 
 def _read_last_lines(path: Path, limit: int) -> list[str]:

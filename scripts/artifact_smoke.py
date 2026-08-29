@@ -119,7 +119,15 @@ def main() -> int:
     version = _capture([str(server), "--version"], cwd=launch_directory)
     if not version.stdout.strip():
         raise RuntimeError("Installed mcp-toolhub --version returned no version")
-    _capture([str(admin), "--help"], cwd=launch_directory)
+    admin_help = _capture([str(admin), "--help"], cwd=launch_directory)
+    if "prune" not in admin_help.stdout:
+        raise RuntimeError("Installed administrator CLI is missing maintenance")
+    prune_help = _capture([str(admin), "prune", "--help"], cwd=launch_directory)
+    for target in ("approvals", "audit"):
+        if target not in prune_help.stdout:
+            raise RuntimeError(
+                f"Installed administrator maintenance target is missing: {target}"
+            )
 
     environment = dict(os.environ)
     environment["TOOLHUB_TEST_SERVER"] = str(server)
