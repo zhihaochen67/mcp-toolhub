@@ -388,3 +388,11 @@ def test_contract_v1_compatibility_fixture_matches_surface():
     expected = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     actual = anyio.run(_contract_surface)
     assert actual == expected
+
+
+def test_production_inventory_remains_fourteen_without_maintenance_tools():
+    tools = anyio.run(create_server().list_tools)
+    names = {tool.name for tool in tools}
+
+    assert len(names) == 14
+    assert all("prune" not in name and "admin" not in name for name in names)

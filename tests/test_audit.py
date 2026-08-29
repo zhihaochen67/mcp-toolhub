@@ -6,7 +6,12 @@ import json
 import os
 import stat
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
@@ -392,3 +397,298 @@ def test_audit_recent_tool_schema_and_reads():
         assert len(content["events"]) <= 5
 
     anyio.run(main)
+
+
+def _raw_audit_lines(*indexes: int) -> list[bytes]:
+    return [
+        (
+            json.dumps(
+                {
+                    "trace_id": f"trc_{index}",
+                    "timestamp": f"2026-04-{index + 1:02d}T00:00:00+00:00",
+                    "tool": "test",
+                    "action": "compact",
+                    "extra": {"index": index},
+                },
+                ensure_ascii=False,
+                indent=None,
+                separators=(", ", ": "),
+            )
+            + "\n"
+        ).encode("utf-8")
+        for index in indexes
+    ]
+
+
+def _wait_for_file(path: Path, *, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists()
+
+
+def test_audit_lock_excludes_another_process(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    outcome = temp_dir / "lock-outcome"
+    contender_code = (
+        "import sys; from pathlib import Path; "
+        "from mcp_toolhub.observability import audit; "
+        "path,outcome=map(Path,sys.argv[1:3]); "
+        "audit.AUDIT_LOCK_TIMEOUT_SECONDS=0.2; "
+        "\ntry:\n"
+        " with audit._audit_write_lock(path): result='acquired'\n"
+        "except TimeoutError: result='timeout'\n"
+        "outcome.write_text(result,encoding='utf-8')"
+    )
+
+    with audit._audit_write_lock(path):
+        subprocess.run(
+            [sys.executable, "-c", contender_code, str(path), str(outcome)],
+            cwd=Path.cwd(),
+            check=True,
+            timeout=10,
+        )
+
+    assert outcome.read_text(encoding="utf-8") == "timeout"
+
+
+def test_audit_lock_waiter_acquires_after_owner_releases(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    ready = temp_dir / "waiter-ready"
+    entered = temp_dir / "waiter-entered"
+    waiter_code = (
+        "import sys; from pathlib import Path; "
+        "from mcp_toolhub.observability import audit; "
+        "path,ready,entered=map(Path,sys.argv[1:4]); "
+        "ready.write_text('ready',encoding='utf-8'); "
+        "\nwith audit._audit_write_lock(path):\n"
+        " entered.write_text('entered',encoding='utf-8')"
+    )
+    process = None
+
+    try:
+        with audit._audit_write_lock(path):
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    waiter_code,
+                    str(path),
+                    str(ready),
+                    str(entered),
+                ],
+                cwd=Path.cwd(),
+            )
+            _wait_for_file(ready)
+            time.sleep(0.2)
+            assert entered.exists() is False
+            assert process.poll() is None
+
+        assert process.wait(timeout=10) == 0
+        assert entered.read_text(encoding="utf-8") == "entered"
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+
+
+def test_audit_lock_is_released_when_owner_process_terminates(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    acquired = temp_dir / "owner-acquired"
+    owner_code = (
+        "import sys,time; from pathlib import Path; "
+        "from mcp_toolhub.observability import audit; "
+        "path,acquired=map(Path,sys.argv[1:3]); "
+        "\nwith audit._audit_write_lock(path):\n"
+        " acquired.write_text('acquired',encoding='utf-8')\n"
+        " while True: time.sleep(1)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", owner_code, str(path), str(acquired)],
+        cwd=Path.cwd(),
+    )
+
+    try:
+        _wait_for_file(acquired)
+        process.terminate()
+        assert process.wait(timeout=10) != 0
+        assert path.with_name(path.name + ".lock").exists()
+
+        monkeypatch.setattr(audit, "AUDIT_LOCK_TIMEOUT_SECONDS", 0.5)
+        with audit._audit_write_lock(path):
+            pass
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+
+
+def test_audit_compaction_dry_run_does_not_mutate(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0, 1, 2)))
+    before = path.read_bytes()
+
+    result = audit.compact_audit(1, audit_path=path)
+
+    assert result.removed == 2
+    assert result.changed is False
+    assert path.read_bytes() == before
+
+
+def test_audit_compaction_keeps_newest_events_in_exact_original_form(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    lines = _raw_audit_lines(0, 1, 2, 3)
+    path.write_bytes(b"".join(lines))
+
+    result = audit.compact_audit(2, apply=True, audit_path=path)
+
+    assert result.total == 4
+    assert result.retained == 2
+    assert result.removed == 2
+    assert result.changed is True
+    assert path.read_bytes() == b"".join(lines[-2:])
+
+
+def test_audit_compaction_keep_at_least_count_is_byte_exact_noop(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    original = b"".join(_raw_audit_lines(0, 1))
+    path.write_bytes(original)
+
+    result = audit.compact_audit(2, apply=True, audit_path=path)
+
+    assert result.removed == 0
+    assert result.changed is False
+    assert path.read_bytes() == original
+
+
+def test_audit_compaction_keep_zero_empties_existing_log(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0, 1)))
+
+    result = audit.compact_audit(0, apply=True, audit_path=path)
+
+    assert result.retained == 0
+    assert result.removed == 2
+    assert path.read_bytes() == b""
+
+
+def test_audit_compaction_missing_file_is_noop(temp_dir):
+    path = temp_dir / "missing-audit.jsonl"
+
+    result = audit.compact_audit(10, apply=True, audit_path=path)
+
+    assert result.total == result.removed == result.retained == 0
+    assert result.changed is False
+    assert path.exists() is False
+
+
+@pytest.mark.parametrize("keep_last", [-1, audit.MAX_COMPACTION_EVENTS + 1])
+def test_audit_compaction_invalid_limit_does_not_mutate(temp_dir, keep_last):
+    path = temp_dir / "audit.jsonl"
+    original = b"".join(_raw_audit_lines(0, 1))
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError):
+        audit.compact_audit(keep_last, apply=True, audit_path=path)
+
+    assert path.read_bytes() == original
+
+
+def test_audit_compaction_malformed_content_fails_closed(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0] + b'{"incomplete":\n'
+    path.write_bytes(original)
+
+    with pytest.raises(audit.AuditMaintenanceError):
+        audit.compact_audit(1, apply=True, audit_path=path)
+
+    assert path.read_bytes() == original
+
+
+def test_concurrent_cross_process_append_is_not_lost_during_compaction(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0, 1, 2)))
+    ready = temp_dir / "writer-ready"
+    go = temp_dir / "writer-go"
+    original_write = audit._write_compacted_audit
+    process = None
+
+    writer_code = (
+        "import sys,time; from pathlib import Path; "
+        "from mcp_toolhub.observability.audit import record_event; "
+        "audit_path,ready,go=map(Path,sys.argv[1:4]); "
+        "ready.write_text('ready',encoding='utf-8'); "
+        "\nwhile not go.exists(): time.sleep(0.01)\n"
+        "ok=record_event(tool='child',action='append',audit_path=audit_path); "
+        "raise SystemExit(0 if ok else 3)"
+    )
+
+    def coordinated_write(compaction_path, retained_offset):
+        nonlocal process
+        process = subprocess.Popen(
+            [sys.executable, "-c", writer_code, str(path), str(ready), str(go)],
+            cwd=Path.cwd(),
+        )
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        go.write_text("go", encoding="utf-8")
+        time.sleep(0.2)
+        assert process.poll() is None
+        original_write(compaction_path, retained_offset)
+
+    monkeypatch.setattr(audit, "_write_compacted_audit", coordinated_write)
+
+    audit.compact_audit(1, apply=True, audit_path=path)
+    assert process is not None
+    assert process.wait(timeout=10) == 0
+
+    events = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["trace_id"] for event in events[:-1]] == ["trc_2"]
+    assert events[-1]["tool"] == "child"
+
+
+def test_record_event_never_raises_when_audit_lock_fails(monkeypatch, temp_dir):
+    @contextmanager
+    def failed_lock(_path):
+        raise TimeoutError("simulated audit lock failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(audit, "_audit_write_lock", failed_lock)
+
+    assert (
+        audit.record_event(
+            tool="test",
+            action="lock_failure",
+            audit_path=temp_dir / "audit.jsonl",
+        )
+        is False
+    )
+
+
+def test_compact_audit_reports_lock_acquisition_failure(monkeypatch, temp_dir):
+    @contextmanager
+    def failed_lock(_path):
+        raise TimeoutError("simulated audit lock failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(audit, "_audit_write_lock", failed_lock)
+
+    with pytest.raises(
+        audit.AuditMaintenanceError,
+        match="could not acquire the audit lock",
+    ):
+        audit.compact_audit(
+            1,
+            apply=True,
+            audit_path=temp_dir / "audit.jsonl",
+        )

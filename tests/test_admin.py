@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -130,3 +131,101 @@ def test_declined_confirmation_leaves_request_pending(
 
     assert admin.main(["approve", request.request_id]) == 1
     assert approval.get_request(request.request_id).status == ApprovalStatus.PENDING
+
+
+def test_admin_help_includes_trusted_maintenance_commands(capsys):
+    parser = admin.build_parser()
+
+    assert "prune" in parser.format_help()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["prune", "--help"])
+
+    assert exc_info.value.code == 0
+    help_output = capsys.readouterr().out
+    assert "approvals" in help_output
+    assert "audit" in help_output
+
+
+def test_admin_approval_prune_is_dry_run_by_default_and_hides_payload(
+    isolated_approval_store,
+    capsys,
+):
+    current = datetime.now(UTC) - timedelta(days=30)
+    sentinel = "TOP-SECRET-MAINTENANCE-PAYLOAD-71c3"
+    request = approval.create_request(
+        kind="file_write",
+        payload={
+            "workspace_root": str(get_workspace_root()),
+            "path": "secret.txt",
+            "content": sentinel,
+        },
+        risk=RiskLevel.HIGH,
+        risk_reason="test",
+        now=current,
+    )
+    approval.reject_request(request.request_id, now=current + timedelta(minutes=1))
+    before = isolated_approval_store.read_bytes()
+
+    assert admin.main(["prune", "approvals", "--older-than-days", "10"]) == 0
+
+    output = capsys.readouterr().out
+    assert "DRY RUN approvals" in output
+    assert "eligible=1" in output
+    assert sentinel not in output
+    assert request.request_id not in output
+    assert isolated_approval_store.read_bytes() == before
+
+
+def test_admin_approval_prune_apply_removes_old_terminal_request(capsys):
+    current = datetime.now(UTC) - timedelta(days=30)
+    request = approval.create_request(
+        risk=RiskLevel.MEDIUM,
+        risk_reason="test",
+        now=current,
+    )
+    approval.reject_request(request.request_id, now=current + timedelta(minutes=1))
+
+    assert (
+        admin.main(
+            [
+                "prune",
+                "approvals",
+                "--older-than-days",
+                "10",
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    assert "APPLY approvals" in capsys.readouterr().out
+    assert approval.get_request(request.request_id) is None
+
+
+def test_admin_audit_prune_dry_run_and_apply(capsys):
+    from mcp_toolhub.observability import audit
+
+    for index in range(3):
+        assert audit.record_event(tool="admin-test", action=str(index)) is True
+    path = audit._default_audit_path()
+    before = path.read_bytes()
+
+    assert admin.main(["prune", "audit", "--keep-last", "1"]) == 0
+    assert "DRY RUN audit" in capsys.readouterr().out
+    assert path.read_bytes() == before
+
+    assert admin.main(["prune", "audit", "--keep-last", "1", "--apply"]) == 0
+    assert "APPLY audit" in capsys.readouterr().out
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_existing_admin_list_and_reject_semantics_remain_available(capsys):
+    request = approval.create_request(
+        risk=RiskLevel.MEDIUM,
+        risk_reason="test",
+    )
+
+    assert admin.main(["list"]) == 0
+    assert request.request_id in capsys.readouterr().out
+    assert admin.main(["reject", request.request_id]) == 0
+    assert approval.get_request(request.request_id).status == ApprovalStatus.REJECTED

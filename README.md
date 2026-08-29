@@ -108,6 +108,8 @@ mcp-toolhub-admin --help
 mcp-toolhub-admin list
 mcp-toolhub-admin approve REQUEST_ID
 mcp-toolhub-admin reject REQUEST_ID
+mcp-toolhub-admin prune approvals --older-than-days N [--apply]
+mcp-toolhub-admin prune audit --keep-last N [--apply]
 ```
 
 The admin command is human-facing and may write ordinary output to stdout. It
@@ -252,6 +254,33 @@ For shell requests, the approval display includes the original program,
 canonical resolved executable, SHA-256, byte size, cwd, and separately
 JSON-escaped argument values. It does not represent arguments as an ambiguous
 shell command string.
+
+## Trusted state maintenance
+
+Trusted-state pruning is explicit, human-operated maintenance through
+`mcp-toolhub-admin`; it never runs at server startup or from an environment
+toggle. Both commands are dry runs unless `--apply` is supplied:
+
+```text
+mcp-toolhub-admin prune approvals --older-than-days 30
+mcp-toolhub-admin prune approvals --older-than-days 30 --apply
+mcp-toolhub-admin prune audit --keep-last 10000
+mcp-toolhub-admin prune audit --keep-last 10000 --apply
+```
+
+Approval pruning removes only terminal `REJECTED`, `EXPIRED`, or `CONSUMED`
+records whose terminal timestamp is at or before the cutoff. A `PENDING` or
+`APPROVED` record that is already past `expires_at` is effectively expired and
+uses that expiry time for eligibility; still-valid pending and approved
+requests are never pruned. Apply mode re-reads and recomputes eligibility while
+holding the approval-store lock.
+
+Audit pruning retains the newest `N` complete events in their original order;
+`--keep-last 0 --apply` explicitly empties an existing valid log. Appends and
+compaction share a cross-process lock, and malformed audit content causes a
+safe refusal without replacement. Maintenance uses only the already-bound
+workspace/state namespace, exposes no protected payloads, and adds no MCP tool
+or Contract V1 surface.
 
 ## Security model and limitations
 

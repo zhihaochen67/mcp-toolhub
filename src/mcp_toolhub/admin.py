@@ -1,4 +1,4 @@
-"""Trusted local administrator CLI for the Approval Engine.
+"""Trusted local administrator CLI for ToolHub administrative state.
 
 This runs as a separate process from the MCP server and is the *only* way to
 approve or reject approval requests. It is intended for a human operator, not
@@ -8,6 +8,8 @@ Usage:
     mcp-toolhub-admin list
     mcp-toolhub-admin approve <request_id>
     mcp-toolhub-admin reject <request_id>
+    mcp-toolhub-admin prune approvals --older-than-days <days> [--apply]
+    mcp-toolhub-admin prune audit --keep-last <count> [--apply]
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json
 import sys
 
 from mcp_toolhub import __version__
+from mcp_toolhub.observability import audit as audit_log
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalRequest, ApprovalStatus
 from mcp_toolhub.security.executable_snapshot import (
@@ -197,10 +200,92 @@ def cmd_reject(args: argparse.Namespace) -> int:
     return 0
 
 
+def _nonnegative_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def _audit_keep_count(value: str) -> int:
+    parsed = _nonnegative_integer(value)
+    if parsed > audit_log.MAX_COMPACTION_EVENTS:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {audit_log.MAX_COMPACTION_EVENTS}"
+        )
+    return parsed
+
+
+def cmd_prune_approvals(args: argparse.Namespace) -> int:
+    try:
+        result = approval.prune_requests(
+            args.older_than_days,
+            apply=args.apply,
+        )
+    except (
+        approval.ApprovalStoreError,
+        OSError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        print(f"error: Approval maintenance failed: {exc}", file=sys.stderr)
+        return 1
+
+    mode = "APPLY" if result.apply_requested else "DRY RUN"
+    print(
+        f"{mode} approvals: total={result.total} eligible={result.eligible} "
+        f"retained={result.retained} cutoff={result.cutoff.isoformat()}"
+    )
+    counts = result.eligible_by_status
+    print(
+        "Eligible terminal states: "
+        f"REJECTED={counts[ApprovalStatus.REJECTED]} "
+        f"EXPIRED={counts[ApprovalStatus.EXPIRED]} "
+        f"CONSUMED={counts[ApprovalStatus.CONSUMED]}"
+    )
+    if not result.apply_requested and result.eligible:
+        print("No records changed; repeat with --apply to prune eligible records.")
+    elif result.apply_requested and not result.changed:
+        print("No records changed.")
+    return 0
+
+
+def cmd_prune_audit(args: argparse.Namespace) -> int:
+    try:
+        result = audit_log.compact_audit(
+            args.keep_last,
+            apply=args.apply,
+        )
+    except (
+        audit_log.AuditMaintenanceError,
+        OSError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        print(f"error: Audit maintenance failed: {exc}", file=sys.stderr)
+        return 1
+
+    mode = "APPLY" if result.apply_requested else "DRY RUN"
+    print(
+        f"{mode} audit: total={result.total} remove={result.removed} "
+        f"retain={result.retained} keep_last={args.keep_last}"
+    )
+    if not result.apply_requested and result.removed:
+        print("No events changed; repeat with --apply to compact the audit log.")
+    elif result.apply_requested and not result.changed:
+        print("No events changed.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcp-toolhub-admin",
-        description="Trusted local administrator CLI for MCP ToolHub approvals.",
+        description="Trusted local administrator CLI for MCP ToolHub state.",
     )
     parser.add_argument("--version", action="version", version=__version__)
 
@@ -224,6 +309,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reject.add_argument("request_id", help="Approval request ID to reject.")
     reject.set_defaults(func=cmd_reject)
+
+    prune = subparsers.add_parser(
+        "prune",
+        help="Plan or apply trusted-state maintenance.",
+    )
+    prune_targets = prune.add_subparsers(dest="prune_target", required=True)
+
+    prune_approvals = prune_targets.add_parser(
+        "approvals",
+        help="Prune old terminal approval records.",
+    )
+    prune_approvals.add_argument(
+        "--older-than-days",
+        type=_nonnegative_integer,
+        required=True,
+        metavar="N",
+        help="Prune terminal records at least N days old.",
+    )
+    prune_approvals.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply deletion; without this flag the command is a dry run.",
+    )
+    prune_approvals.set_defaults(func=cmd_prune_approvals)
+
+    prune_audit = prune_targets.add_parser(
+        "audit",
+        help="Compact the audit log to its newest complete events.",
+    )
+    prune_audit.add_argument(
+        "--keep-last",
+        type=_audit_keep_count,
+        required=True,
+        metavar="N",
+        help=f"Retain newest N events (maximum {audit_log.MAX_COMPACTION_EVENTS}).",
+    )
+    prune_audit.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply compaction; without this flag the command is a dry run.",
+    )
+    prune_audit.set_defaults(func=cmd_prune_audit)
 
     return parser
 

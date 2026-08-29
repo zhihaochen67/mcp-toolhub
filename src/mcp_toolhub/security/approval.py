@@ -29,6 +29,7 @@ import secrets
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -99,6 +100,19 @@ _READABLE_STORE_VERSIONS = frozenset({1, STORE_VERSION})
 
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_STALE_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class ApprovalPruneResult:
+    """Aggregate-only result for trusted approval-store maintenance."""
+
+    apply_requested: bool
+    changed: bool
+    cutoff: datetime
+    total: int
+    eligible: int
+    retained: int
+    eligible_by_status: dict[ApprovalStatus, int]
 
 
 def _now() -> datetime:
@@ -300,6 +314,58 @@ def _expired(request: ApprovalRequest, now: datetime | None = None) -> bool:
     if request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}:
         return (now or _now()) >= request.expires_at
     return False
+
+
+def _prune_timestamp(
+    request: ApprovalRequest,
+    *,
+    now: datetime,
+) -> tuple[ApprovalStatus, datetime] | None:
+    """Return the effective terminal status and its deterministic age basis."""
+    if request.status in {ApprovalStatus.REJECTED, ApprovalStatus.CONSUMED}:
+        if request.decided_at is None:
+            return None
+        return request.status, request.decided_at
+
+    if request.status == ApprovalStatus.EXPIRED:
+        return request.status, request.decided_at or request.expires_at
+
+    if request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED} and _expired(
+        request, now
+    ):
+        return ApprovalStatus.EXPIRED, request.expires_at
+
+    return None
+
+
+def _approval_prune_plan(
+    requests: dict[str, ApprovalRequest],
+    *,
+    cutoff: datetime,
+    now: datetime,
+) -> tuple[set[str], dict[ApprovalStatus, int]]:
+    eligible_ids: set[str] = set()
+    by_status = {
+        ApprovalStatus.REJECTED: 0,
+        ApprovalStatus.EXPIRED: 0,
+        ApprovalStatus.CONSUMED: 0,
+    }
+
+    try:
+        for request_id, request in requests.items():
+            terminal = _prune_timestamp(request, now=now)
+            if terminal is None:
+                continue
+            status, timestamp = terminal
+            if timestamp <= cutoff:
+                eligible_ids.add(request_id)
+                by_status[status] += 1
+    except TypeError as exc:
+        raise ApprovalStoreError(
+            "Approval store contains an invalid timestamp."
+        ) from exc
+
+    return eligible_ids, by_status
 
 
 def _apply_decision(
@@ -548,3 +614,60 @@ def list_requests(
 
     results.sort(key=lambda r: r.created_at)
     return results
+
+
+def prune_requests(
+    older_than_days: int,
+    *,
+    apply: bool = False,
+    store_path: Path | None = None,
+    now: datetime | None = None,
+) -> ApprovalPruneResult:
+    """Plan or apply pruning of sufficiently old, effectively terminal requests.
+
+    Dry runs read without writing. Apply mode acquires the approval-store lock,
+    re-reads the store, and recomputes eligibility before an atomic rewrite so a
+    previously observed plan is never used as deletion authority.
+    """
+    if isinstance(older_than_days, bool) or not isinstance(older_than_days, int):
+        raise TypeError("older_than_days must be an integer")
+    if older_than_days < 0:
+        raise ValueError("older_than_days must be at least 0")
+
+    path = store_path or _default_store_path()
+    current = now or _now()
+    try:
+        cutoff = current - timedelta(days=older_than_days)
+    except OverflowError as exc:
+        raise ValueError("older_than_days is too large") from exc
+
+    def evaluate(requests: dict[str, ApprovalRequest]) -> ApprovalPruneResult:
+        eligible_ids, by_status = _approval_prune_plan(
+            requests,
+            cutoff=cutoff,
+            now=current,
+        )
+        changed = apply and bool(eligible_ids)
+        if changed:
+            retained = {
+                request_id: request
+                for request_id, request in requests.items()
+                if request_id not in eligible_ids
+            }
+            _write_store(path, retained)
+
+        return ApprovalPruneResult(
+            apply_requested=apply,
+            changed=changed,
+            cutoff=cutoff,
+            total=len(requests),
+            eligible=len(eligible_ids),
+            retained=len(requests) - len(eligible_ids),
+            eligible_by_status=by_status,
+        )
+
+    if not apply:
+        return evaluate(_read_store(path))
+
+    with _store_lock(path):
+        return evaluate(_read_store(path))
