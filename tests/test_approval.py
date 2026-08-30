@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +24,32 @@ def _create_request(**kwargs):
     }
     defaults.update(kwargs)
     return approval.create_request(**defaults)
+
+
+def _concurrent_create_request(
+    store_path: str,
+    start_event,
+    result_queue,
+    max_records: int,
+    max_bytes: int,
+) -> None:
+    """Spawn-safe contender used to prove the cross-process quota lock."""
+    approval.MAX_APPROVAL_RECORDS = max_records
+    approval.MAX_APPROVAL_STORE_BYTES = max_bytes
+    start_event.wait()
+    try:
+        request = approval.create_request(
+            program="python",
+            args=["--version"],
+            cwd=".",
+            risk=RiskLevel.MEDIUM,
+            risk_reason="concurrency test",
+            store_path=Path(store_path),
+        )
+    except approval.ApprovalStoreCapacityError as exc:
+        result_queue.put(("capacity", exc.dimension))
+    else:
+        result_queue.put(("created", request.request_id))
 
 
 def test_request_ids_are_cryptographically_random():
@@ -105,6 +133,246 @@ def test_store_is_persistent_json(isolated_approval_store):
     assert raw["requests"][request.request_id]["status"] == "PENDING"
     assert raw["requests"][request.request_id]["trace_id"] == request.trace_id
     assert raw["requests"][request.request_id]["resume_tool"] == "shell.run_approved"
+
+
+def test_record_capacity_allows_exact_limit_and_refuses_one_over_unchanged(
+    isolated_approval_store,
+    monkeypatch,
+):
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 3)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", 1_000_000)
+
+    created = [_create_request() for _ in range(3)]
+    before = isolated_approval_store.read_bytes()
+
+    with pytest.raises(approval.ApprovalStoreCapacityError) as exc_info:
+        _create_request(payload={"content": "must-not-be-persisted"})
+
+    assert exc_info.value.dimension == "records"
+    assert exc_info.value.resulting == 4
+    assert exc_info.value.limit == 3
+    assert isolated_approval_store.read_bytes() == before
+    assert {item.request_id for item in approval.list_requests()} == {
+        item.request_id for item in created
+    }
+
+
+def test_byte_capacity_allows_exact_limit_and_refuses_one_over(
+    isolated_approval_store,
+    temp_dir,
+    monkeypatch,
+):
+    current = datetime(2026, 5, 1, tzinfo=UTC)
+    request_id = "req_" + "a" * 32
+    kwargs = {
+        "payload": {"content": "bounded payload"},
+        "trace_id": "trc_capacity_boundary",
+        "now": current,
+    }
+    monkeypatch.setattr(approval, "_new_request_id", lambda: request_id)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 10)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", 1_000_000)
+
+    probe_path = temp_dir / "probe.json"
+    probe = _create_request(store_path=probe_path, **kwargs)
+    assert probe_path.read_bytes() == approval._serialize_store(
+        {probe.request_id: probe}
+    )
+    exact_size = len(probe_path.read_bytes())
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", exact_size)
+    exact_path = temp_dir / "exact.json"
+    exact = _create_request(store_path=exact_path, **kwargs)
+    assert exact.request_id == request_id
+    assert len(exact_path.read_bytes()) == exact_size
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", exact_size - 1)
+    before = (
+        isolated_approval_store.read_bytes()
+        if isolated_approval_store.exists()
+        else b""
+    )
+    with pytest.raises(approval.ApprovalStoreCapacityError) as exc_info:
+        _create_request(**kwargs)
+
+    assert exc_info.value.dimension == "bytes"
+    assert exc_info.value.resulting == exact_size
+    assert exc_info.value.limit == exact_size - 1
+    assert (
+        isolated_approval_store.read_bytes()
+        if isolated_approval_store.exists()
+        else b""
+    ) == before
+
+
+def test_byte_capacity_counts_utf8_bytes_not_python_characters(
+    isolated_approval_store,
+    temp_dir,
+    monkeypatch,
+):
+    current = datetime(2026, 5, 1, tzinfo=UTC)
+    kwargs = {
+        "payload": {"content": "\u754c" * 20},
+        "trace_id": "trc_utf8_capacity",
+        "now": current,
+    }
+    monkeypatch.setattr(approval, "_new_request_id", lambda: "req_" + "b" * 32)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 10)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", 1_000_000)
+
+    probe_path = temp_dir / "utf8-probe.json"
+    _create_request(store_path=probe_path, **kwargs)
+    serialized = probe_path.read_bytes()
+    character_count = len(serialized.decode("utf-8"))
+    assert character_count < len(serialized)
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", character_count)
+    with pytest.raises(approval.ApprovalStoreCapacityError) as exc_info:
+        _create_request(**kwargs)
+
+    assert exc_info.value.dimension == "bytes"
+    assert exc_info.value.resulting == len(serialized)
+    assert not isolated_approval_store.exists()
+
+
+def test_capacity_exception_is_bounded_and_contains_no_protected_payload(
+    monkeypatch,
+):
+    sentinel = "TOP-SECRET-CAPACITY-PAYLOAD-9f11"
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 0)
+
+    with pytest.raises(approval.ApprovalStoreCapacityError) as exc_info:
+        _create_request(
+            program=sentinel,
+            args=[sentinel],
+            payload={"content": sentinel, "path": sentinel},
+        )
+
+    diagnostic = str(exc_info.value)
+    assert sentinel not in diagnostic
+    assert len(diagnostic) < 500
+    assert "prune approvals" in diagnostic
+
+
+def test_existing_oversized_store_refuses_additions_but_allows_transitions(
+    isolated_approval_store,
+    monkeypatch,
+):
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 3)
+    first, second, third = (_create_request() for _ in range(3))
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 2)
+    before = isolated_approval_store.read_bytes()
+
+    with pytest.raises(approval.ApprovalStoreCapacityError):
+        _create_request()
+
+    assert isolated_approval_store.read_bytes() == before
+    assert approval.approve_request(first.request_id).status == ApprovalStatus.APPROVED
+    assert approval.reject_request(second.request_id).status == ApprovalStatus.REJECTED
+    assert approval.approve_request(third.request_id).status == ApprovalStatus.APPROVED
+    assert approval.consume_request(third.request_id).status == ApprovalStatus.CONSUMED
+    assert len(approval.list_requests()) == 3
+
+
+def test_existing_byte_oversized_store_refuses_additions_but_allows_transition(
+    isolated_approval_store,
+    monkeypatch,
+):
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", 1_000_000)
+    request = _create_request(payload={"content": "bounded"})
+    before = isolated_approval_store.read_bytes()
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", len(before) - 1)
+
+    with pytest.raises(approval.ApprovalStoreCapacityError) as exc_info:
+        _create_request()
+
+    assert exc_info.value.dimension == "bytes"
+    assert isolated_approval_store.read_bytes() == before
+    assert (
+        approval.approve_request(request.request_id).status == ApprovalStatus.APPROVED
+    )
+
+
+def test_oversized_store_can_be_pruned_and_capacity_recovered(
+    isolated_approval_store,
+    monkeypatch,
+):
+    current = datetime(2026, 5, 20, tzinfo=UTC)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 2)
+    requests = [_create_request(now=current - timedelta(days=30)) for _ in range(2)]
+    for request in requests:
+        approval.reject_request(
+            request.request_id,
+            now=current - timedelta(days=30) + timedelta(minutes=1),
+        )
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 1)
+    before = isolated_approval_store.read_bytes()
+
+    dry_run = approval.prune_requests(10, now=current)
+    assert dry_run.eligible == 2
+    assert isolated_approval_store.read_bytes() == before
+
+    applied = approval.prune_requests(10, apply=True, now=current)
+    assert applied.changed is True
+    assert applied.retained == 0
+    assert _create_request(now=current).status == ApprovalStatus.PENDING
+
+
+def test_create_request_keeps_malformed_store_unchanged(isolated_approval_store):
+    malformed = b'{"version":2,"requests":['
+    isolated_approval_store.write_bytes(malformed)
+
+    with pytest.raises(approval.ApprovalStoreError):
+        _create_request()
+
+    assert isolated_approval_store.read_bytes() == malformed
+
+
+def test_concurrent_process_creators_cannot_exceed_record_capacity(
+    isolated_approval_store,
+    monkeypatch,
+):
+    max_records = 3
+    max_bytes = 1_000_000
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", max_records)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", max_bytes)
+    existing = [_create_request() for _ in range(max_records - 1)]
+
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_create_request,
+            args=(
+                str(isolated_approval_store),
+                start_event,
+                result_queue,
+                max_records,
+                max_bytes,
+            ),
+        )
+        for _ in range(4)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    results = [result_queue.get(timeout=5) for _ in processes]
+    created = [value for outcome, value in results if outcome == "created"]
+    refused = [value for outcome, value in results if outcome == "capacity"]
+    assert len(created) == 1
+    assert refused == ["records"] * 3
+
+    raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
+    final_ids = set(raw["requests"])
+    assert len(final_ids) == max_records
+    assert {request.request_id for request in existing} <= final_ids
+    assert created[0] in final_ids
+    assert len(isolated_approval_store.read_bytes()) <= max_bytes
 
 
 def test_version_one_store_is_read_with_derived_contract_metadata(

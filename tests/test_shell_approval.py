@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from mcp_toolhub.contracts import ContractOutcome
+from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security.approval import ApprovalStatus
 from mcp_toolhub.security.executable_snapshot import resolve_executable_snapshot
@@ -187,6 +188,25 @@ def test_high_command_creates_pending_request(high_python_command):
     environment = stored.payload["execution_environment"]
     assert environment["policy_version"] == 1
     assert len(environment["sha256"]) == 64
+
+
+def test_shell_capacity_refusal_is_safe_and_creates_no_handle(monkeypatch):
+    sentinel = "TOP-SECRET-SHELL-CAPACITY-7d31"
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 0)
+
+    result = run_shell("pytest", [sentinel])
+
+    assert result.outcome == ContractOutcome.FAILED
+    assert result.error.code == "APPROVAL_STORE_CAPACITY"
+    assert result.error.retryable is False
+    assert result.executed is False
+    assert result.approval is None
+    assert result.request_id is None
+    assert result.approval_status is None
+    assert sentinel not in result.error.message
+    assert sentinel not in result.message
+    assert approval.list_requests() == []
+    assert sentinel not in json.dumps(audit.read_recent(limit=10))
 
 
 def test_pending_cannot_run():

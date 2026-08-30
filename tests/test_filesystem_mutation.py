@@ -117,6 +117,30 @@ def test_write_file_create_requires_approval_and_creates(temp_dir):
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == "hello world"
 
 
+def test_write_file_capacity_refusal_is_safe_and_creates_no_handle(
+    temp_dir,
+    monkeypatch,
+):
+    sentinel = "TOP-SECRET-WRITE-CAPACITY-1b27"
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 0)
+
+    result = write_file("capacity.txt", sentinel, root=temp_dir)
+
+    assert result.outcome == ContractOutcome.FAILED
+    assert result.error.code == "APPROVAL_STORE_CAPACITY"
+    assert result.executed is False
+    assert result.approval is None
+    assert result.request_id is None
+    assert result.approval_status is None
+    assert sentinel not in result.error.message
+    assert sentinel not in result.message
+    assert not (temp_dir / "capacity.txt").exists()
+    assert approval.list_requests() == []
+    assert sentinel not in (get_state_root() / "audit.jsonl").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_write_file_modifies_existing_file(temp_dir):
     _put(temp_dir, "a.txt", "old")
 
@@ -358,6 +382,33 @@ def test_apply_patch_valid_patch_succeeds(temp_dir):
     assert done.previous_hash == _sha(old)
     assert done.new_hash == _sha(new)
     assert (temp_dir / "a.txt").read_text(encoding="utf-8") == new
+
+
+def test_apply_patch_capacity_refusal_is_safe_and_creates_no_handle(
+    temp_dir,
+    monkeypatch,
+):
+    original = "before\n"
+    sentinel = "TOP-SECRET-PATCH-CAPACITY-2c81"
+    _put(temp_dir, "capacity.txt", original)
+    patch = _make_patch("capacity.txt", original, f"{sentinel}\n")
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 0)
+
+    result = apply_patch("capacity.txt", patch, root=temp_dir)
+
+    assert result.outcome == ContractOutcome.FAILED
+    assert result.error.code == "APPROVAL_STORE_CAPACITY"
+    assert result.executed is False
+    assert result.approval is None
+    assert result.request_id is None
+    assert result.approval_status is None
+    assert sentinel not in result.error.message
+    assert sentinel not in result.message
+    assert (temp_dir / "capacity.txt").read_text(encoding="utf-8") == original
+    assert approval.list_requests() == []
+    assert sentinel not in (get_state_root() / "audit.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_apply_patch_malformed_rejected(temp_dir):

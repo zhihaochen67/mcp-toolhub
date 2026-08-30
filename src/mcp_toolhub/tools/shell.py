@@ -543,21 +543,48 @@ def run_shell(
         workspace_root=get_workspace_root(),
     )
     policy_metadata["execution_environment"] = execution_environment.audit_metadata()
-    request = approval.create_request(
-        program=program,
-        args=command_args,
-        cwd=relative_cwd,
-        timeout_seconds=timeout_seconds,
-        risk=assessment.level,
-        risk_reason=assessment.reason,
-        payload={
-            "workspace_root": str(get_workspace_root()),
-            "command_policy": policy_metadata,
-            "executable_snapshot": executable_metadata,
-            "execution_environment": execution_environment.to_payload(),
-        },
-        trace_id=trace_id,
-    )
+    try:
+        request = approval.create_request(
+            program=program,
+            args=command_args,
+            cwd=relative_cwd,
+            timeout_seconds=timeout_seconds,
+            risk=assessment.level,
+            risk_reason=assessment.reason,
+            payload={
+                "workspace_root": str(get_workspace_root()),
+                "command_policy": policy_metadata,
+                "executable_snapshot": executable_metadata,
+                "execution_environment": execution_environment.to_payload(),
+            },
+            trace_id=trace_id,
+        )
+    except approval.ApprovalStoreCapacityError as exc:
+        message = str(exc)
+        audit.record_event(
+            trace_id=trace_id,
+            tool="shell.run",
+            action="approval_request_refused",
+            risk=assessment.level,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"request_kind": "shell"},
+            error=message,
+            error_type=type(exc).__name__,
+        )
+        return ShellRunResult(
+            outcome=ContractOutcome.FAILED,
+            trace_id=trace_id,
+            error=make_contract_error("APPROVAL_STORE_CAPACITY", message),
+            program=program,
+            args=command_args,
+            cwd=relative_cwd,
+            risk=assessment.level,
+            risk_reason=assessment.reason,
+            executed=False,
+            message=message,
+        )
 
     audit.record_event(
         trace_id=trace_id,

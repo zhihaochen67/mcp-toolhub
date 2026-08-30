@@ -641,19 +641,42 @@ def write_file(
             message=str(exc),
         )
 
-    request = approval.create_request(
-        kind="file_write",
-        payload={
-            "path": path,
-            "content": content,
-            "expected_hash": expected_hash,
-            "create_parents": create_parents,
-            "workspace_root": str(root),
-        },
-        risk=RiskLevel.MEDIUM,
-        risk_reason=WRITE_RISK_REASON,
-        trace_id=trace_id,
-    )
+    try:
+        request = approval.create_request(
+            kind="file_write",
+            payload={
+                "path": path,
+                "content": content,
+                "expected_hash": expected_hash,
+                "create_parents": create_parents,
+                "workspace_root": str(root),
+            },
+            risk=RiskLevel.MEDIUM,
+            risk_reason=WRITE_RISK_REASON,
+            trace_id=trace_id,
+        )
+    except approval.ApprovalStoreCapacityError as exc:
+        message = str(exc)
+        audit.record_event(
+            trace_id=trace_id,
+            tool="filesystem.write_file",
+            action="approval_request_refused",
+            risk=RiskLevel.MEDIUM,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"request_kind": "file_write"},
+            error=message,
+            error_type=type(exc).__name__,
+        )
+        return WriteFileResult(
+            outcome=ContractOutcome.FAILED,
+            trace_id=trace_id,
+            error=make_contract_error("APPROVAL_STORE_CAPACITY", message),
+            path=path,
+            executed=False,
+            message=message,
+        )
 
     audit.record_event(
         trace_id=trace_id,
@@ -923,18 +946,41 @@ def apply_patch(
             message=str(exc),
         )
 
-    request = approval.create_request(
-        kind="file_patch",
-        payload={
-            "path": path,
-            "patch": patch,
-            "expected_hash": expected_hash,
-            "workspace_root": str(root),
-        },
-        risk=RiskLevel.MEDIUM,
-        risk_reason=PATCH_RISK_REASON,
-        trace_id=trace_id,
-    )
+    try:
+        request = approval.create_request(
+            kind="file_patch",
+            payload={
+                "path": path,
+                "patch": patch,
+                "expected_hash": expected_hash,
+                "workspace_root": str(root),
+            },
+            risk=RiskLevel.MEDIUM,
+            risk_reason=PATCH_RISK_REASON,
+            trace_id=trace_id,
+        )
+    except approval.ApprovalStoreCapacityError as exc:
+        message = str(exc)
+        audit.record_event(
+            trace_id=trace_id,
+            tool="filesystem.apply_patch",
+            action="approval_request_refused",
+            risk=RiskLevel.MEDIUM,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={"request_kind": "file_patch"},
+            error=message,
+            error_type=type(exc).__name__,
+        )
+        return ApplyPatchResult(
+            outcome=ContractOutcome.FAILED,
+            trace_id=trace_id,
+            error=make_contract_error("APPROVAL_STORE_CAPACITY", message),
+            path=path,
+            executed=False,
+            message=message,
+        )
 
     audit.record_event(
         trace_id=trace_id,
