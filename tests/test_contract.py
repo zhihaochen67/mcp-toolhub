@@ -384,6 +384,26 @@ def test_structured_content_is_primary_for_contract_tools():
     anyio.run(main)
 
 
+def test_capacity_refusal_is_a_structured_mcp_result(monkeypatch):
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 0)
+
+    async def main():
+        server = create_server()
+        result = await server.call_tool(
+            "filesystem.write_file",
+            {"path": "capacity.txt", "content": "not persisted"},
+        )
+
+        assert result.is_error is False
+        assert result.structured_content["outcome"] == "FAILED"
+        assert result.structured_content["executed"] is False
+        assert result.structured_content["approval"] is None
+        assert result.structured_content["request_id"] is None
+        assert result.structured_content["error"]["code"] == "APPROVAL_STORE_CAPACITY"
+
+    anyio.run(main)
+
+
 def test_contract_v1_compatibility_fixture_matches_surface():
     expected = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     actual = anyio.run(_contract_surface)

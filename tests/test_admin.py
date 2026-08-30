@@ -235,6 +235,49 @@ def test_admin_approval_prune_apply_removes_old_terminal_request(capsys):
     assert approval.get_request(request.request_id) is None
 
 
+def test_admin_prune_recovers_an_existing_oversized_store(monkeypatch, capsys):
+    current = datetime.now(UTC) - timedelta(days=30)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 2)
+    requests = [
+        approval.create_request(
+            risk=RiskLevel.MEDIUM,
+            risk_reason="test",
+            now=current,
+        )
+        for _ in range(2)
+    ]
+    for request in requests:
+        approval.reject_request(request.request_id, now=current + timedelta(minutes=1))
+    monkeypatch.setattr(approval, "MAX_APPROVAL_RECORDS", 1)
+    current_size = approval._default_store_path().stat().st_size
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", current_size - 1)
+
+    assert (
+        admin.main(
+            [
+                "prune",
+                "approvals",
+                "--older-than-days",
+                "10",
+                "--apply",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "APPLY approvals" in output
+    assert "eligible=2" in output
+    assert approval.list_requests() == []
+    assert (
+        approval.create_request(
+            risk=RiskLevel.MEDIUM,
+            risk_reason="test",
+        ).status
+        == ApprovalStatus.PENDING
+    )
+
+
 def test_admin_audit_prune_dry_run_and_apply(capsys):
     from mcp_toolhub.observability import audit
 

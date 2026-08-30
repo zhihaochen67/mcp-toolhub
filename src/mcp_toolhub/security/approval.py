@@ -49,6 +49,29 @@ class ApprovalStoreError(RuntimeError):
     """The trusted approval store is malformed or incompatible."""
 
 
+class ApprovalStoreCapacityError(ApprovalStoreError):
+    """A new request would exceed a fixed approval-store capacity limit."""
+
+    def __init__(self, dimension: str, *, resulting: int, limit: int) -> None:
+        if dimension == "records":
+            detail = f"resulting record count {resulting} exceeds limit {limit}"
+        elif dimension == "bytes":
+            detail = (
+                f"resulting serialized size {resulting} bytes exceeds limit {limit}"
+            )
+        else:  # pragma: no cover - internal misuse guard
+            raise ValueError(f"Unsupported approval capacity dimension: {dimension}")
+
+        self.dimension = dimension
+        self.resulting = resulting
+        self.limit = limit
+        super().__init__(
+            f"Approval store capacity reached: {detail}. A trusted administrator "
+            "should prune old terminal approvals with `mcp-toolhub-admin prune "
+            "approvals --older-than-days N` and repeat with `--apply`."
+        )
+
+
 class ApprovalRequest(BaseModel):
     """An immutable-on-approval description of an action awaiting approval.
 
@@ -97,6 +120,9 @@ class ApprovalRequest(BaseModel):
 DEFAULT_TTL_SECONDS = 300  # 5 minutes
 STORE_VERSION = 2
 _READABLE_STORE_VERSIONS = frozenset({1, STORE_VERSION})
+
+MAX_APPROVAL_RECORDS = 10_000
+MAX_APPROVAL_STORE_BYTES = 16 * 1024 * 1024
 
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_STALE_SECONDS = 15.0
@@ -228,13 +254,8 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
     return requests
 
 
-def _write_store(
-    store_path: Path,
-    requests: dict[str, ApprovalRequest],
-) -> None:
-    """Write the store atomically: temp file + fsync + os.replace."""
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-
+def _serialize_store(requests: dict[str, ApprovalRequest]) -> bytes:
+    """Return the complete deterministic UTF-8 representation persisted to disk."""
     payload = {
         "version": STORE_VERSION,
         "requests": {
@@ -243,11 +264,18 @@ def _write_store(
         },
     }
 
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _write_serialized_store(store_path: Path, serialized: bytes) -> None:
+    """Atomically persist one already-serialized store representation."""
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+
     tmp_path = store_path.parent / f".approvals-{secrets.token_hex(8)}.tmp"
 
     try:
-        with open(tmp_path, "x", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        with open(tmp_path, "xb") as handle:
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -259,6 +287,14 @@ def _write_store(
         except OSError:
             pass
         raise
+
+
+def _write_store(
+    store_path: Path,
+    requests: dict[str, ApprovalRequest],
+) -> None:
+    """Serialize and atomically write the store."""
+    _write_serialized_store(store_path, _serialize_store(requests))
 
 
 @contextmanager
@@ -461,8 +497,28 @@ def create_request(
 
     with _store_lock(path):
         store = _read_store(path)
+        if request.request_id in store:
+            raise ApprovalStoreError("Generated duplicate approval request ID.")
+
+        resulting_count = len(store) + 1
+        if resulting_count > MAX_APPROVAL_RECORDS:
+            raise ApprovalStoreCapacityError(
+                "records",
+                resulting=resulting_count,
+                limit=MAX_APPROVAL_RECORDS,
+            )
+
         store[request.request_id] = request
-        _write_store(path, store)
+        serialized = _serialize_store(store)
+        serialized_size = len(serialized)
+        if serialized_size > MAX_APPROVAL_STORE_BYTES:
+            raise ApprovalStoreCapacityError(
+                "bytes",
+                resulting=serialized_size,
+                limit=MAX_APPROVAL_STORE_BYTES,
+            )
+
+        _write_serialized_store(path, serialized)
 
     return request
 

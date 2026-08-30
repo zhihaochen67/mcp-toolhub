@@ -276,6 +276,23 @@ uses that expiry time for eligibility; still-valid pending and approved
 requests are never pruned. Apply mode re-reads and recomputes eligibility while
 holding the approval-store lock.
 
+### Approval store capacity
+
+`approvals.json` has fixed ceilings of 10,000 records and 16 MiB for its final
+serialized UTF-8 representation. ToolHub checks both limits atomically under
+the approval-store lock when adding a request. Values exactly at either limit
+are allowed; a new request that would exceed a limit fails closed without
+changing the store.
+
+ToolHub never automatically deletes approval records or evicts valid active
+requests to make room. When the store is full, an administrator can inspect and
+prune old terminal records with `mcp-toolhub-admin prune approvals
+--older-than-days N`; pruning remains explicit and is a dry run unless
+`--apply` is supplied. Existing approval state transitions and explicit pruning
+remain available when a previously created or restored store is already over a
+current ceiling. These ceilings bound ToolHub's approval store; they are not a
+general disk quota or operating-system resource sandbox.
+
 Audit pruning retains the newest `N` complete events in their original order;
 `--keep-last 0 --apply` explicitly empties an existing valid log. Appends and
 compaction share a cross-process lock, and malformed audit content causes a
