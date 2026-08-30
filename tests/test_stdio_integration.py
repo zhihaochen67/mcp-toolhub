@@ -437,6 +437,54 @@ async def _exercise_stdio(
                 assert shell_done["stdout"] == "toolhub-shell-ok\nABSENT\n"
                 assert secret_value not in json.dumps(shell_done)
 
+                large_request = _json_result(
+                    await session.call_tool(
+                        "shell.run",
+                        {
+                            "program": str(runtime_python),
+                            "args": [
+                                "-c",
+                                (
+                                    "import sys\n"
+                                    "chunk = b'L' * 65536\n"
+                                    "for _ in range(64):\n"
+                                    "    sys.stdout.buffer.write(chunk)\n"
+                                    "    sys.stderr.buffer.write(chunk)\n"
+                                    "    sys.stdout.buffer.flush()\n"
+                                    "    sys.stderr.buffer.flush()\n"
+                                ),
+                            ],
+                        },
+                    )
+                )
+                assert large_request["outcome"] == "APPROVAL_REQUIRED"
+                large_id = large_request["request_id"]
+                large_handle = large_request["approval"]
+                code, _stdout, admin_stderr = await _admin_command(
+                    admin,
+                    ["approve", large_id],
+                    launch_directory=launch_directory,
+                    environment=environment,
+                    confirmation=True,
+                )
+                assert code == 0, admin_stderr
+                large_done = _json_result(
+                    await session.call_tool(
+                        large_handle["resume_tool"],
+                        {"request_id": large_id},
+                    )
+                )
+                # Discarded output is a reporting fact, not a failure.
+                assert large_done["outcome"] == "SUCCEEDED"
+                assert large_done["returncode"] == 0
+                assert large_done["stdout"].startswith("L" * 20_000)
+                assert "\n\n[ToolHub discarded " in large_done["stdout"]
+                assert large_done["stdout"].endswith(" output bytes]")
+                assert len(large_done["stdout"]) <= 20_000 + 64
+                assert large_done["stderr"].startswith("L" * 20_000)
+                assert "\n\n[ToolHub discarded " in large_done["stderr"]
+                assert len(large_done["stderr"]) <= 20_000 + 64
+
                 child_pid_file = workspace / "timed-out-child.pid"
                 child_code = "import time; time.sleep(60)"
                 parent_code = (

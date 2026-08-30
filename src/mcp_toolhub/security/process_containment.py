@@ -1,13 +1,16 @@
 """OS-backed process-tree containment for ToolHub child processes.
 
 The public entry point in this module launches exactly one absolute executable
-with ``shell=False`` and captures UTF-8 text output.  POSIX children run in a
-new session/process group.  Windows children are created suspended, assigned
-to a per-execution Job Object configured with kill-on-close, and only then
-resumed.
+with ``shell=False``.  stdout/stderr are binary pipes continuously drained by
+dedicated bounded reader threads from the moment the process starts (see
+``mcp_toolhub.security.bounded_output``), so output collection memory is O(1)
+in produced volume and a noisy contained descendant can never fill an OS pipe
+buffer and deadlock.  POSIX children run in a new session/process group.
+Windows children are created suspended, assigned to a per-execution Job Object
+configured with kill-on-close, and only then resumed.
 
-This boundary intentionally contains process lifetime only.  It is not a
-filesystem, network, or resource-usage sandbox.
+This boundary intentionally contains process lifetime and output capture
+memory only.  It is not a filesystem, network, or resource-usage sandbox.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from mcp_toolhub.security.bounded_output import CaptureStats, OutputCapture
+
 PROCESS_CONTAINMENT_POLICY_VERSION = 1
 
 _GRACEFUL_TERMINATION_SECONDS = 0.5
@@ -29,6 +34,8 @@ _FORCED_TERMINATION_SECONDS = 2.0
 _FINAL_REAP_SECONDS = 1.0
 _POLL_INTERVAL_SECONDS = 0.01
 _MAX_DIAGNOSTIC_CHARS = 300
+_DRAIN_EOF_WAIT_SECONDS = 1.0
+_DRAIN_JOIN_SECONDS = 1.0
 
 _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _WINDOWS_JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
@@ -56,6 +63,9 @@ class ContainmentMetadata:
         }
 
 
+_EMPTY_CAPTURE_STATS = CaptureStats()
+
+
 @dataclass(frozen=True)
 class ContainedProcessResult:
     """Captured outcome of one contained external execution."""
@@ -66,6 +76,21 @@ class ContainedProcessResult:
     timed_out: bool
     cleanup_error: str | None
     containment: ContainmentMetadata
+    stdout_stats: CaptureStats = _EMPTY_CAPTURE_STATS
+    stderr_stats: CaptureStats = _EMPTY_CAPTURE_STATS
+
+    def capture_audit_metadata(self) -> dict[str, object]:
+        """Return safe numeric/boolean capture accounting for audit."""
+        return {
+            "stdout_total_bytes": self.stdout_stats.total_bytes,
+            "stdout_retained_bytes": self.stdout_stats.retained_bytes,
+            "stdout_dropped_bytes": self.stdout_stats.dropped_bytes,
+            "stdout_truncated": self.stdout_stats.truncated,
+            "stderr_total_bytes": self.stderr_stats.total_bytes,
+            "stderr_retained_bytes": self.stderr_stats.retained_bytes,
+            "stderr_dropped_bytes": self.stderr_stats.dropped_bytes,
+            "stderr_truncated": self.stderr_stats.truncated,
+        }
 
 
 class ProcessContainmentError(RuntimeError):
@@ -98,19 +123,6 @@ def _bounded_diagnostic(value: object) -> str:
     return text[:_MAX_DIAGNOSTIC_CHARS] + "...[truncated]"
 
 
-def _to_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
-def _newer_output(previous: str, candidate: str | bytes | None) -> str:
-    current = _to_text(candidate)
-    return current if len(current) >= len(previous) else previous
-
-
 def _popen(
     executable: str,
     args: Sequence[str],
@@ -119,7 +131,7 @@ def _popen(
     env: Mapping[str, str],
     start_new_session: bool = False,
     creationflags: int = 0,
-) -> subprocess.Popen[str]:
+) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [executable, *args],
         cwd=cwd,
@@ -127,9 +139,7 @@ def _popen(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        bufsize=0,
         shell=False,
         close_fds=True,
         start_new_session=start_new_session,
@@ -137,16 +147,24 @@ def _popen(
     )
 
 
-def _close_capture_pipes(process: subprocess.Popen[str]) -> None:
+def _start_capture(process: subprocess.Popen[bytes]) -> OutputCapture:
+    """Start both bounded drain threads over the launched binary pipes."""
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("Contained process capture pipes are unavailable.")
+    return OutputCapture(process.stdout, process.stderr)
+
+
+def _close_process_pipes_without_readers(process: subprocess.Popen[bytes]) -> None:
+    """Close capture pipes only when no drain thread can exist."""
     for stream in (process.stdout, process.stderr):
         if stream is not None:
             try:
                 stream.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
 
-def _wait_primary(process: subprocess.Popen[str], timeout: float) -> bool:
+def _wait_primary(process: subprocess.Popen[bytes], timeout: float) -> bool:
     if process.returncode is not None:
         return True
     try:
@@ -156,21 +174,25 @@ def _wait_primary(process: subprocess.Popen[str], timeout: float) -> bool:
     return True
 
 
-def _communicate_bounded(
-    process: subprocess.Popen[str],
-    timeout: float,
-    stdout: str,
-    stderr: str,
-) -> tuple[str, str, bool]:
-    try:
-        final_stdout, final_stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        return (
-            _newer_output(stdout, exc.stdout),
-            _newer_output(stderr, exc.stderr),
-            False,
-        )
-    return _to_text(final_stdout), _to_text(final_stderr), True
+def _finalize_capture(
+    capture: OutputCapture,
+    cleanup_errors: list[str],
+) -> bool:
+    """Finish one execution's output drains with bounded waits.
+
+    After the contained tree has exited (or been terminated), give the drain
+    threads a short interval to observe EOF.  If pipes remain open — a writer
+    outside the contained tree keeping inherited handles — signal the
+    non-blocking readers to stop, then bounded-join them.  Pipe handles are
+    closed only after their readers finish.  Returns ``True`` only when both
+    drains reached EOF without error.
+    """
+    if not capture.wait_for_eof(_DRAIN_EOF_WAIT_SECONDS):
+        capture.close_streams()
+    finished, drain_error = capture.join_readers(_DRAIN_JOIN_SECONDS)
+    if drain_error:
+        cleanup_errors.append(drain_error)
+    return finished and drain_error is None
 
 
 def _posix_group_exists(process_group: int) -> bool:
@@ -204,16 +226,15 @@ def _wait_for_posix_group_exit(process_group: int, timeout: float) -> bool:
 
 
 def _terminate_posix_tree(
-    process: subprocess.Popen[str],
     process_group: int,
     metadata: ContainmentMetadata,
-    stdout: str,
-    stderr: str,
-) -> tuple[str, str, bool, str | None]:
-    """Terminate and reap one isolated POSIX session/process group."""
+    cleanup_errors: list[str],
+) -> None:
+    """TERM -> KILL one isolated POSIX session/process group.
 
-    cleanup_errors: list[str] = []
-    communication_complete = process.returncode is not None
+    Uses the existing bounded waits.  The drain reader threads keep consuming
+    output concurrently throughout, so no extra output handling happens here.
+    """
 
     try:
         if _signal_posix_group(process_group, signal.SIGTERM):
@@ -221,15 +242,11 @@ def _terminate_posix_tree(
     except OSError as exc:
         cleanup_errors.append(f"Graceful process-group termination failed: {exc}")
 
-    stdout, stderr, communication_complete = _communicate_bounded(
-        process,
-        _GRACEFUL_TERMINATION_SECONDS,
-        stdout,
-        stderr,
-    )
-
     try:
-        group_remains = _posix_group_exists(process_group)
+        group_remains = not _wait_for_posix_group_exit(
+            process_group,
+            _GRACEFUL_TERMINATION_SECONDS,
+        )
     except OSError as exc:
         group_remains = True
         cleanup_errors.append(f"Process-group state check failed: {exc}")
@@ -241,39 +258,10 @@ def _terminate_posix_tree(
         except OSError as exc:
             cleanup_errors.append(f"Forced process-group termination failed: {exc}")
 
-        stdout, stderr, communication_complete = _communicate_bounded(
-            process,
-            _FORCED_TERMINATION_SECONDS,
-            stdout,
-            stderr,
-        )
-
-    if not communication_complete:
-        _close_capture_pipes(process)
-
-    primary_reaped = _wait_primary(process, _FINAL_REAP_SECONDS)
-    try:
-        group_gone = _wait_for_posix_group_exit(
-            process_group,
-            _FINAL_REAP_SECONDS,
-        )
-    except OSError as exc:
-        group_gone = False
-        cleanup_errors.append(f"Final process-group state check failed: {exc}")
-    succeeded = primary_reaped and group_gone and communication_complete
-    metadata.tree_termination_succeeded = succeeded
-
-    if not primary_reaped:
-        cleanup_errors.append("Primary process could not be reaped within the bound.")
-    if not group_gone:
-        cleanup_errors.append("Contained process group remained active.")
-    if not communication_complete:
-        cleanup_errors.append("Contained output pipes did not close within the bound.")
-
-    diagnostic = (
-        _bounded_diagnostic(" ".join(cleanup_errors)) if cleanup_errors else None
-    )
-    return stdout, stderr, succeeded, diagnostic
+        try:
+            _wait_for_posix_group_exit(process_group, _FORCED_TERMINATION_SECONDS)
+        except OSError as exc:
+            cleanup_errors.append(f"Forced process-group exit check failed: {exc}")
 
 
 def _run_posix(
@@ -293,72 +281,94 @@ def _run_posix(
         start_new_session=True,
     )
     process_group = process.pid
-    stdout = ""
-    stderr = ""
+    capture: OutputCapture | None = None
     timed_out = False
+    cleanup_errors: list[str] = []
+    communication_complete = False
 
     try:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
+        capture = _start_capture(process)
+        primary_done = _wait_primary(process, timeout_seconds)
+        if not primary_done:
             timed_out = True
-            stdout = _newer_output(stdout, exc.stdout)
-            stderr = _newer_output(stderr, exc.stderr)
 
-        group_remains = _posix_group_exists(process_group)
+        try:
+            group_remains = _posix_group_exists(process_group)
+        except OSError as exc:
+            group_remains = True
+            cleanup_errors.append(f"Process-group state check failed: {exc}")
+
         if timed_out or group_remains:
-            stdout, stderr, succeeded, cleanup_error = _terminate_posix_tree(
-                process,
-                process_group,
-                metadata,
-                stdout,
-                stderr,
+            _terminate_posix_tree(process_group, metadata, cleanup_errors)
+
+        communication_complete = _finalize_capture(capture, cleanup_errors)
+
+        primary_reaped = _wait_primary(process, _FINAL_REAP_SECONDS)
+        try:
+            group_gone = not _posix_group_exists(process_group)
+        except OSError as exc:
+            group_gone = False
+            cleanup_errors.append(f"Final process-group state check failed: {exc}")
+
+        if not primary_reaped:
+            cleanup_errors.append(
+                "Primary process could not be reaped within the bound."
             )
-            if not succeeded and not timed_out:
-                raise ProcessContainmentError(
-                    cleanup_error or "Contained process-tree cleanup failed.",
-                    launched=True,
-                    containment=metadata,
-                )
-            return ContainedProcessResult(
-                process.returncode,
-                stdout,
-                stderr,
-                timed_out,
-                cleanup_error,
-                metadata,
+        if not group_gone:
+            cleanup_errors.append("Contained process group remained active.")
+
+        succeeded = (
+            primary_reaped
+            and group_gone
+            and communication_complete
+            and not cleanup_errors
+        )
+        metadata.tree_termination_succeeded = succeeded
+        if not succeeded and not timed_out:
+            raise ProcessContainmentError(
+                _bounded_diagnostic(" ".join(cleanup_errors))
+                or "Contained process-tree cleanup failed.",
+                launched=True,
+                containment=metadata,
             )
 
+        stdout, stderr = capture.text()
+        stdout_stats, stderr_stats = capture.stats()
+        cleanup_error = (
+            _bounded_diagnostic(" ".join(cleanup_errors)) if cleanup_errors else None
+        )
         return ContainedProcessResult(
             process.returncode,
-            _to_text(stdout),
-            _to_text(stderr),
-            False,
-            None,
+            stdout,
+            stderr,
+            timed_out,
+            cleanup_error,
             metadata,
+            stdout_stats,
+            stderr_stats,
         )
     except ProcessContainmentError:
         raise
     except BaseException as exc:
-        stdout, stderr, _succeeded, cleanup_error = _terminate_posix_tree(
-            process,
-            process_group,
-            metadata,
-            stdout,
-            stderr,
-        )
+        _terminate_posix_tree(process_group, metadata, cleanup_errors)
+        if capture is not None:
+            _finalize_capture(capture, cleanup_errors)
+        _wait_primary(process, _FINAL_REAP_SECONDS)
         if not isinstance(exc, Exception):
             raise
         diagnostic = "Contained process execution failed."
-        if cleanup_error:
-            diagnostic += f" {cleanup_error}"
+        if cleanup_errors:
+            diagnostic += " " + " ".join(cleanup_errors)
         raise ProcessContainmentError(
             diagnostic,
             launched=True,
             containment=metadata,
         ) from exc
     finally:
-        _close_capture_pipes(process)
+        if capture is not None:
+            capture.close_streams()
+        else:
+            _close_process_pipes_without_readers(process)
 
 
 class _WindowsJobApi(Protocol):
@@ -574,14 +584,14 @@ class _WindowsJob:
         self._api.close_handle(handle)
 
 
-def _windows_process_handle(process: subprocess.Popen[str]) -> int:
+def _windows_process_handle(process: subprocess.Popen[bytes]) -> int:
     handle = getattr(process, "_handle", None)
     if handle is None:
         raise OSError("Windows process handle is unavailable.")
     return int(handle)
 
 
-def _close_windows_process_handle(process: subprocess.Popen[str]) -> None:
+def _close_windows_process_handle(process: subprocess.Popen[bytes]) -> None:
     handle = getattr(process, "_handle", None)
     close = getattr(handle, "Close", None)
     if close is not None:
@@ -598,13 +608,20 @@ def _wait_for_windows_job_exit(job: _WindowsJob, timeout: float) -> bool:
     return True
 
 
-def _abort_unassigned_windows_process(process: subprocess.Popen[str]) -> None:
+def _abort_unassigned_windows_process(
+    process: subprocess.Popen[bytes],
+    capture: OutputCapture | None,
+    cleanup_errors: list[str],
+) -> None:
     try:
         process.terminate()
     except OSError:
         pass
-    _close_capture_pipes(process)
+    if capture is not None:
+        _finalize_capture(capture, cleanup_errors)
     _wait_primary(process, _FINAL_REAP_SECONDS)
+    if capture is None:
+        _close_process_pipes_without_readers(process)
 
 
 def _run_windows(
@@ -617,9 +634,8 @@ def _run_windows(
 ) -> ContainedProcessResult:
     metadata = containment_policy_metadata()
     job = _WindowsJob.create()
-    process: subprocess.Popen[str] | None = None
-    stdout = ""
-    stderr = ""
+    process: subprocess.Popen[bytes] | None = None
+    capture: OutputCapture | None = None
     timed_out = False
     cleanup_errors: list[str] = []
     communication_complete = False
@@ -632,20 +648,17 @@ def _run_windows(
             env=env,
             creationflags=_WINDOWS_CREATE_SUSPENDED,
         )
+        capture = _start_capture(process)
         try:
             job.assign_and_resume(_windows_process_handle(process))
         except BaseException:
             if not job.assigned:
-                _abort_unassigned_windows_process(process)
+                _abort_unassigned_windows_process(process, capture, cleanup_errors)
             raise
 
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            communication_complete = True
-        except subprocess.TimeoutExpired as exc:
+        primary_done = _wait_primary(process, timeout_seconds)
+        if not primary_done:
             timed_out = True
-            stdout = _newer_output(stdout, exc.stdout)
-            stderr = _newer_output(stderr, exc.stderr)
 
         try:
             active_processes = job.active_processes()
@@ -659,12 +672,6 @@ def _run_windows(
                 job.terminate()
             except OSError as exc:
                 cleanup_errors.append(f"Job Object termination failed: {exc}")
-            stdout, stderr, communication_complete = _communicate_bounded(
-                process,
-                _FORCED_TERMINATION_SECONDS,
-                stdout,
-                stderr,
-            )
             try:
                 job_empty = _wait_for_windows_job_exit(
                     job,
@@ -676,6 +683,8 @@ def _run_windows(
         else:
             job_empty = True
 
+        communication_complete = _finalize_capture(capture, cleanup_errors)
+
     except BaseException as exc:
         if process is not None and job.assigned:
             metadata.tree_termination_attempted = True
@@ -683,12 +692,10 @@ def _run_windows(
                 job.terminate()
             except OSError as cleanup_exc:
                 cleanup_errors.append(f"Job Object termination failed: {cleanup_exc}")
-            stdout, stderr, communication_complete = _communicate_bounded(
-                process,
-                _FORCED_TERMINATION_SECONDS,
-                stdout,
-                stderr,
-            )
+        elif process is not None and capture is None:
+            _abort_unassigned_windows_process(process, None, cleanup_errors)
+        if capture is not None:
+            _finalize_capture(capture, cleanup_errors)
         if not isinstance(exc, Exception):
             raise
         if process is None and isinstance(exc, OSError):
@@ -702,8 +709,10 @@ def _run_windows(
             containment=metadata,
         ) from exc
     finally:
-        if process is not None and not communication_complete:
-            _close_capture_pipes(process)
+        if capture is not None:
+            capture.close_streams()
+        elif process is not None:
+            _close_process_pipes_without_readers(process)
         try:
             job.close()
         except OSError as exc:
@@ -712,7 +721,7 @@ def _run_windows(
             _wait_primary(process, _FINAL_REAP_SECONDS)
             _close_windows_process_handle(process)
 
-    if process is None:
+    if process is None or capture is None:
         raise RuntimeError("Contained Windows launch did not create a process.")
 
     primary_reaped = process.returncode is not None
@@ -724,8 +733,6 @@ def _run_windows(
         cleanup_errors.append("Primary process could not be reaped within the bound.")
     if not job_empty:
         cleanup_errors.append("Contained Job Object remained active.")
-    if not communication_complete:
-        cleanup_errors.append("Contained output pipes did not close within the bound.")
 
     cleanup_error = (
         _bounded_diagnostic(" ".join(cleanup_errors)) if cleanup_errors else None
@@ -737,6 +744,8 @@ def _run_windows(
             containment=metadata,
         )
 
+    stdout, stderr = capture.text()
+    stdout_stats, stderr_stats = capture.stats()
     return ContainedProcessResult(
         process.returncode,
         stdout,
@@ -744,6 +753,8 @@ def _run_windows(
         timed_out,
         cleanup_error,
         metadata,
+        stdout_stats,
+        stderr_stats,
     )
 
 

@@ -346,6 +346,35 @@ container: it does not add filesystem or network sandboxing, CPU or memory
 resource isolation, kernel-level protection, or safe execution of arbitrary
 hostile code.
 
+### Bounded output capture
+
+Approved shell executions and fixed read-only Git subprocesses capture stdout
+and stderr through dedicated per-stream drain threads that start together with
+the child process and read continuously until the pipes reach EOF. Each stream
+retains at most 256 KiB (`MAX_CAPTURE_BYTES_PER_STREAM`) in a fixed-capacity
+buffer; everything beyond that cap is still drained from the pipe but
+discarded, with exact total/retained/dropped byte counters recorded as bounded
+audit metadata.
+
+Because the pipes are always drained, a child or contained descendant that
+writes more than the OS pipe capacity cannot block the capture path, and
+ToolHub memory for retained output is O(1) in the volume produced. Output
+truncation is a reporting fact, not a failure: a command that exits 0 with
+discarded output remains `SUCCEEDED`, a non-zero exit remains
+`COMMAND_FAILED`, and timeouts remain `TIMED_OUT`. When the capture cap
+discards output, the affected stdout/stderr value carries a deterministic
+`[ToolHub discarded N output bytes]` marker.
+
+Timeout and process-tree containment semantics are unchanged: on timeout
+ToolHub terminates the contained tree, keeps draining until EOF or a bounded
+deadline, closes its pipe handles as a final unblock if needed, and returns
+`TIMED_OUT` with the retained output prefix.
+
+Bounded capture protects ToolHub's own retained output memory (at most a few
+hundred KiB of retained buffers per subprocess plus small transient read
+chunks). It is not a CPU, memory, network, or filesystem sandbox for the child
+process itself.
+
 ToolHub guarantees:
 
 - LOW never creates an external subprocess.
@@ -377,8 +406,8 @@ size, scope, and request-ID correlation.
 
 Audit events are appended to `audit.jsonl` under the trusted state root. They
 contain bounded metadata, redact recognizable secret arguments, and store only
-stdout/stderr character counts rather than raw process output. Audit write
-failures are non-fatal to tool execution.
+stdout/stderr character counts and bounded capture byte counters rather than
+raw process output. Audit write failures are non-fatal to tool execution.
 
 ### Contract compatibility fixture
 

@@ -80,6 +80,37 @@ def _truncate_output(value: str) -> str:
     return value[:MAX_OUTPUT_CHARS] + f"\n\n[ToolHub truncated {remaining} characters]"
 
 
+def _format_captured_output(
+    value: str,
+    *,
+    capture_truncated: bool,
+    dropped_bytes: int,
+) -> str:
+    """Apply the public character limit, then report discarded bytes.
+
+    When the containment layer retained the complete stream this preserves the
+    existing character-based truncation marker exactly.  When containment
+    already discarded output beyond its retention cap, the returned value
+    instead carries a single deterministic discarded-byte marker (the public
+    20_000-character prefix limit still applies) so no duplicate or confusing
+    markers appear.
+    """
+    if not capture_truncated:
+        return _truncate_output(value)
+
+    if len(value) > MAX_OUTPUT_CHARS:
+        kept = value[:MAX_OUTPUT_CHARS]
+        char_cut_bytes = len(value.encode("utf-8", errors="replace")) - len(
+            kept.encode("utf-8", errors="replace")
+        )
+    else:
+        kept = value
+        char_cut_bytes = 0
+
+    discarded = dropped_bytes + max(0, char_cut_bytes)
+    return kept + f"\n\n[ToolHub discarded {discarded} output bytes]"
+
+
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
@@ -210,7 +241,10 @@ def _execute_subprocess(
             message=message or "Approved command could not be started.",
         )
 
-    audit_extra = {"containment": completed.containment.audit_metadata()}
+    audit_extra = {
+        "containment": completed.containment.audit_metadata(),
+        "capture": completed.capture_audit_metadata(),
+    }
     if policy_metadata is not None:
         audit_extra["command_policy"] = policy_metadata
 
@@ -252,8 +286,16 @@ def _execute_subprocess(
             risk=risk,
             risk_reason=risk_reason,
             executed=True,
-            stdout=_truncate_output(completed.stdout),
-            stderr=_truncate_output(completed.stderr),
+            stdout=_format_captured_output(
+                completed.stdout,
+                capture_truncated=completed.stdout_stats.truncated,
+                dropped_bytes=completed.stdout_stats.dropped_bytes,
+            ),
+            stderr=_format_captured_output(
+                completed.stderr,
+                capture_truncated=completed.stderr_stats.truncated,
+                dropped_bytes=completed.stderr_stats.dropped_bytes,
+            ),
             timed_out=True,
             request_id=request_id,
             approval_status=approval_status,
@@ -302,8 +344,16 @@ def _execute_subprocess(
         risk_reason=risk_reason,
         executed=True,
         returncode=completed.returncode,
-        stdout=_truncate_output(completed.stdout),
-        stderr=_truncate_output(completed.stderr),
+        stdout=_format_captured_output(
+            completed.stdout,
+            capture_truncated=completed.stdout_stats.truncated,
+            dropped_bytes=completed.stdout_stats.dropped_bytes,
+        ),
+        stderr=_format_captured_output(
+            completed.stderr,
+            capture_truncated=completed.stderr_stats.truncated,
+            dropped_bytes=completed.stderr_stats.dropped_bytes,
+        ),
         request_id=request_id,
         approval_status=approval_status,
         message=message,

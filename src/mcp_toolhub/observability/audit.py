@@ -9,8 +9,9 @@ Security / privacy properties
 * Trace IDs are cryptographically random (``secrets``) and therefore
   unpredictable and unguessable.
 * The log stores metadata and bounded summaries only: no full file contents,
-  no raw stdout/stderr (only their character counts), and argument values are
-  truncated and redacted when they look like secrets.
+  no raw stdout/stderr (only their character counts and bounded capture byte
+  counters), and argument values are truncated and redacted when they look
+  like secrets.
 * ``record_event`` never raises: if the log cannot be written, the failure is
   swallowed so auditing can never break the main tool path.
 * This module has no MCP dependency: MCP-facing surfaces (e.g. the read-only
