@@ -251,6 +251,7 @@ def test_launch_is_absolute_shell_free_and_path_independent(temp_dir, monkeypatc
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stdout"] == subprocess.PIPE
     assert kwargs["stderr"] == subprocess.PIPE
+    assert kwargs["bufsize"] == 0
     assert kwargs["env"] == environment
     assert "PATH" not in kwargs["env"]
 
@@ -259,7 +260,7 @@ def test_internal_exception_after_launch_still_reaps_process(temp_dir, monkeypat
     from mcp_toolhub.security import process_containment
 
     original_popen = process_containment.subprocess.Popen
-    original_communicate = subprocess.Popen.communicate
+    original_wait_primary = process_containment._wait_primary
     processes = []
     first_call = True
 
@@ -268,15 +269,15 @@ def test_internal_exception_after_launch_still_reaps_process(temp_dir, monkeypat
         processes.append(process)
         return process
 
-    def fail_once(self, *args, **kwargs):
+    def fail_once(process, timeout):
         nonlocal first_call
         if first_call:
             first_call = False
             raise RuntimeError("simulated internal failure")
-        return original_communicate(self, *args, **kwargs)
+        return original_wait_primary(process, timeout)
 
     monkeypatch.setattr(process_containment.subprocess, "Popen", spy_popen)
-    monkeypatch.setattr(original_popen, "communicate", fail_once)
+    monkeypatch.setattr(process_containment, "_wait_primary", fail_once)
 
     with pytest.raises(ProcessContainmentError) as captured:
         run_contained_process(
@@ -290,6 +291,41 @@ def test_internal_exception_after_launch_still_reaps_process(temp_dir, monkeypat
     assert captured.value.launched is True
     assert processes[0].returncode is not None
     assert captured.value.containment.tree_termination_attempted is True
+
+
+def test_capture_setup_failure_after_launch_still_reaps_process(
+    temp_dir,
+    monkeypatch,
+):
+    from mcp_toolhub.security import process_containment
+
+    original_popen = process_containment.subprocess.Popen
+    processes = []
+
+    def spy_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_capture_setup(process):
+        raise OSError("simulated non-blocking pipe setup failure")
+
+    monkeypatch.setattr(process_containment.subprocess, "Popen", spy_popen)
+    monkeypatch.setattr(process_containment, "_start_capture", fail_capture_setup)
+
+    with pytest.raises(ProcessContainmentError) as captured:
+        run_contained_process(
+            sys.executable,
+            ["-c", "import time; time.sleep(60)"],
+            cwd=temp_dir,
+            env=build_execution_environment().environment(),
+            timeout_seconds=5,
+        )
+
+    assert captured.value.launched is True
+    assert processes[0].returncode is not None
+    assert processes[0].stdout.closed is True
+    assert processes[0].stderr.closed is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group behavior")

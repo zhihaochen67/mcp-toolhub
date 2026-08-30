@@ -19,8 +19,10 @@ Every git subprocess is launched with the same read-only posture:
 * ``GIT_TERMINAL_PROMPT=0`` — no interactive prompting.
 * ``--no-ext-diff`` / ``--no-textconv`` (diff) — repository-configured
   external diff helpers and textconv filters never execute.
-* ``stdin=DEVNULL``, ``capture_output=True``, ``shell=False``, a hard
-  timeout, and bounded output for everything else.
+* ``stdin=DEVNULL``, ``shell=False``, a hard timeout, and continuously
+  drained, memory-bounded output capture for everything else (excess output
+  is discarded while the pipes are still read, so Git can never fill an OS
+  pipe buffer and block).
 
 Repository-boundary containment
 -------------------------------
@@ -38,8 +40,8 @@ is addressed at that repository's location.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -74,6 +76,17 @@ _GIT_ENV_EXTRA = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_PAGER": "cat",
 }
+
+
+@dataclass(frozen=True)
+class _RunGitResult:
+    """Bounded outcome of one contained read-only git subprocess."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stdout_dropped_bytes: int
 
 
 class GitStatusEntry(BaseModel):
@@ -112,6 +125,36 @@ def _truncate(value: str, limit: int = GIT_MAX_OUTPUT_CHARS) -> str:
     return value[:limit] + f"\n...[+{len(value) - limit} chars truncated]"
 
 
+def _format_raw_output(
+    value: str,
+    *,
+    capture_truncated: bool,
+    dropped_bytes: int,
+) -> str:
+    """Apply the public Git character limit, then report discarded bytes.
+
+    When the containment layer retained the complete stream this preserves the
+    existing character-based truncation marker exactly.  When containment
+    already discarded output beyond its retention cap, the returned value
+    instead carries a single deterministic discarded-byte marker (the public
+    20_000-character prefix limit still applies).
+    """
+    if not capture_truncated:
+        return _truncate(value)
+
+    if len(value) > GIT_MAX_OUTPUT_CHARS:
+        kept = value[:GIT_MAX_OUTPUT_CHARS]
+        char_cut_bytes = len(value.encode("utf-8", errors="replace")) - len(
+            kept.encode("utf-8", errors="replace")
+        )
+    else:
+        kept = value
+        char_cut_bytes = 0
+
+    discarded = dropped_bytes + max(0, char_cut_bytes)
+    return kept + f"\n...[+{discarded} output bytes discarded]"
+
+
 def _resolve_repo_path(root: Path, path: str) -> Path:
     """Resolve a repository-relative path and guarantee it stays inside the
     repository root (rejecting absolute paths and ``..`` escapes)."""
@@ -131,7 +174,7 @@ def _resolve_repo_path(root: Path, path: str) -> Path:
     return target
 
 
-def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_git(root: Path, argv: list[str]) -> _RunGitResult:
     """Run a git subcommand with the hardened read-only posture."""
     located = shutil.which("git")
     if located is None:
@@ -141,7 +184,6 @@ def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
     except (OSError, RuntimeError) as exc:
         raise ValueError("Git executable could not be resolved") from exc
 
-    command = [str(git_executable), *_GIT_GLOBAL_ARGS, *argv]
     environment = build_execution_environment(
         additional_variables=_GIT_ENV_EXTRA
     ).environment()
@@ -170,11 +212,12 @@ def _run_git(root: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
         )
     if result.returncode is None:
         raise ValueError("Git execution did not return a process exit status.")
-    return subprocess.CompletedProcess(
-        command,
-        result.returncode,
+    return _RunGitResult(
+        returncode=result.returncode,
         stdout=result.stdout,
         stderr=result.stderr,
+        stdout_truncated=result.stdout_stats.truncated,
+        stdout_dropped_bytes=result.stdout_stats.dropped_bytes,
     )
 
 
@@ -212,7 +255,7 @@ class GitWorkspaceError(ValueError):
     """The discovered Git worktree root lies outside the ToolHub workspace."""
 
 
-def _git_error(completed: subprocess.CompletedProcess[str]) -> GitCommandError:
+def _git_error(completed: _RunGitResult) -> GitCommandError:
     stderr = completed.stderr.strip() or "git failed"
     detail = _truncate(stderr, GIT_MAX_ERROR_CHARS)
     return GitCommandError(f"git exited {completed.returncode}: {detail}")
@@ -380,7 +423,11 @@ def git_status(root: Path | None = None) -> GitStatusResult:
         branch=branch,
         clean=not entries,
         entries=entries,
-        raw=_truncate(completed.stdout),
+        raw=_format_raw_output(
+            completed.stdout,
+            capture_truncated=completed.stdout_truncated,
+            dropped_bytes=completed.stdout_dropped_bytes,
+        ),
     )
 
 
@@ -458,7 +505,11 @@ def git_diff(
         )
         raise error
 
-    raw = _truncate(completed.stdout)
+    raw = _format_raw_output(
+        completed.stdout,
+        capture_truncated=completed.stdout_truncated,
+        dropped_bytes=completed.stdout_dropped_bytes,
+    )
     additions, deletions, binary = _count_diff(raw)
 
     audit.record_event(
