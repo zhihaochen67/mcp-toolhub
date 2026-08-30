@@ -22,6 +22,7 @@ Security properties
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -43,6 +44,11 @@ from mcp_toolhub.contracts import (
 from mcp_toolhub.observability.audit import new_trace_id
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.risk import RiskLevel
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 class ApprovalStoreError(RuntimeError):
@@ -125,7 +131,7 @@ MAX_APPROVAL_RECORDS = 10_000
 MAX_APPROVAL_STORE_BYTES = 16 * 1024 * 1024
 
 LOCK_TIMEOUT_SECONDS = 5.0
-LOCK_STALE_SECONDS = 15.0
+_LOCK_RETRY_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -297,46 +303,68 @@ def _write_store(
     _write_serialized_store(store_path, _serialize_store(requests))
 
 
+def _acquire_os_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_os_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    if os.name == "nt":
+        winerror = getattr(exc, "winerror", None)
+        if winerror is not None:
+            return winerror in {33, 36}
+    return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+
+
 @contextmanager
 def _store_lock(store_path: Path) -> Iterator[None]:
-    """Advisory cross-process lock via an O_EXCL lock file, with stale-lock
-    recovery so a crashed writer cannot wedge the store forever."""
+    """Hold an OS-backed cross-process lock for one store critical section."""
     store_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = store_path.with_name(store_path.name + ".lock")
-
+    # Keep this sidecar stable: unlinking or replacing it could let contenders
+    # lock different underlying files and both enter the critical section.
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-    fd: int | None = None
-
-    while True:
-        try:
-            fd = os.open(
-                lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            )
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SECONDS:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                pass
-
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Approval store is locked: {lock_path}")
-            time.sleep(0.05)
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(lock_path, open_flags, 0o600)
+    locked = False
 
     try:
-        if fd is not None:
-            os.write(fd, str(os.getpid()).encode("ascii"))
-            os.close(fd)
-            fd = None
+        while True:
+            try:
+                _acquire_os_lock(descriptor)
+                locked = True
+                break
+            except OSError as exc:
+                if not _is_lock_contention(exc):
+                    raise
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Approval store lock acquisition timed out."
+                    ) from exc
+                time.sleep(min(_LOCK_RETRY_SECONDS, remaining))
 
         yield
-
     finally:
+        if locked:
+            try:
+                _release_os_lock(descriptor)
+            except OSError:
+                pass
         try:
-            lock_path.unlink(missing_ok=True)
+            os.close(descriptor)
         except OSError:
             pass
 

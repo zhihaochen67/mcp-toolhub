@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 from datetime import UTC, datetime, timedelta
@@ -48,8 +49,44 @@ def _concurrent_create_request(
         )
     except approval.ApprovalStoreCapacityError as exc:
         result_queue.put(("capacity", exc.dimension))
+    except Exception as exc:  # noqa: BLE001 - report child failures to the parent
+        result_queue.put(("error", type(exc).__name__))
     else:
         result_queue.put(("created", request.request_id))
+
+
+def _wait_for_store_lock(store_path: str, ready_event, entered_event) -> None:
+    """Spawn-safe waiter used to prove lock serialization."""
+    ready_event.set()
+    with approval._store_lock(Path(store_path)):
+        entered_event.set()
+
+
+def _contend_for_store_lock(
+    store_path: str,
+    ready_event,
+    result_queue,
+    timeout_seconds: float,
+) -> None:
+    """Spawn-safe contender used to prove bounded timeout behavior."""
+    approval.LOCK_TIMEOUT_SECONDS = timeout_seconds
+    ready_event.set()
+    try:
+        with approval._store_lock(Path(store_path)):
+            pass
+    except TimeoutError:
+        result_queue.put(("timeout", "TimeoutError"))
+    except Exception as exc:  # noqa: BLE001 - report child failures to the parent
+        result_queue.put(("error", type(exc).__name__))
+    else:
+        result_queue.put(("acquired", None))
+
+
+def _hold_store_lock(store_path: str, held_event, release_event) -> None:
+    """Spawn-safe owner used to prove process teardown releases the OS lock."""
+    with approval._store_lock(Path(store_path)):
+        held_event.set()
+        release_event.wait(timeout=30)
 
 
 def test_request_ids_are_cryptographically_random():
@@ -364,15 +401,156 @@ def test_concurrent_process_creators_cannot_exceed_record_capacity(
     results = [result_queue.get(timeout=5) for _ in processes]
     created = [value for outcome, value in results if outcome == "created"]
     refused = [value for outcome, value in results if outcome == "capacity"]
+    errors = [value for outcome, value in results if outcome == "error"]
     assert len(created) == 1
     assert refused == ["records"] * 3
+    assert errors == []
 
     raw = json.loads(isolated_approval_store.read_text(encoding="utf-8"))
     final_ids = set(raw["requests"])
+    persisted_request_ids = [
+        record["request_id"] for record in raw["requests"].values()
+    ]
     assert len(final_ids) == max_records
     assert {request.request_id for request in existing} <= final_ids
     assert created[0] in final_ids
+    assert len(persisted_request_ids) == len(set(persisted_request_ids))
+    assert set(persisted_request_ids) == final_ids
     assert len(isolated_approval_store.read_bytes()) <= max_bytes
+
+
+def test_store_lock_serializes_processes_and_keeps_stable_sidecar(
+    isolated_approval_store,
+):
+    context = multiprocessing.get_context("spawn")
+    ready_event = context.Event()
+    entered_event = context.Event()
+    process = context.Process(
+        target=_wait_for_store_lock,
+        args=(str(isolated_approval_store), ready_event, entered_event),
+    )
+    lock_path = isolated_approval_store.with_name(
+        isolated_approval_store.name + ".lock"
+    )
+
+    try:
+        with approval._store_lock(isolated_approval_store):
+            process.start()
+            assert ready_event.wait(timeout=10)
+            assert entered_event.wait(timeout=0.25) is False
+
+        assert entered_event.wait(timeout=10)
+        process.join(timeout=10)
+        assert process.exitcode == 0
+        assert lock_path.exists()
+
+        with approval._store_lock(isolated_approval_store):
+            assert lock_path.exists()
+        assert lock_path.exists()
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+
+def test_store_lock_contention_times_out_without_permission_error(
+    isolated_approval_store,
+):
+    context = multiprocessing.get_context("spawn")
+    ready_event = context.Event()
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_contend_for_store_lock,
+        args=(str(isolated_approval_store), ready_event, result_queue, 0.2),
+    )
+
+    try:
+        with approval._store_lock(isolated_approval_store):
+            process.start()
+            assert ready_event.wait(timeout=10)
+            process.join(timeout=10)
+            assert process.exitcode == 0
+            assert result_queue.get(timeout=5) == ("timeout", "TimeoutError")
+
+        with approval._store_lock(isolated_approval_store):
+            pass
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+
+def test_store_lock_is_released_when_owner_process_terminates(
+    isolated_approval_store,
+    monkeypatch,
+):
+    context = multiprocessing.get_context("spawn")
+    held_event = context.Event()
+    release_event = context.Event()
+    process = context.Process(
+        target=_hold_store_lock,
+        args=(str(isolated_approval_store), held_event, release_event),
+    )
+    process.start()
+
+    try:
+        assert held_event.wait(timeout=10)
+        process.terminate()
+        process.join(timeout=10)
+        assert process.exitcode != 0
+        assert isolated_approval_store.with_name(
+            isolated_approval_store.name + ".lock"
+        ).exists()
+
+        monkeypatch.setattr(approval, "LOCK_TIMEOUT_SECONDS", 0.5)
+        with approval._store_lock(isolated_approval_store):
+            pass
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+
+def test_store_lock_propagates_sidecar_permission_failure(
+    isolated_approval_store,
+    monkeypatch,
+):
+    def deny_open(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "access denied")
+
+    def unexpected_retry(_seconds):
+        raise AssertionError("sidecar permission failures must not be retried")
+
+    monkeypatch.setattr(approval.os, "open", deny_open)
+    monkeypatch.setattr(approval.time, "sleep", unexpected_retry)
+
+    with (
+        pytest.raises(PermissionError),
+        approval._store_lock(isolated_approval_store),
+    ):
+        pass
+
+
+def test_store_lock_propagates_non_contention_lock_error(
+    isolated_approval_store,
+    monkeypatch,
+):
+    def fail_lock(_descriptor):
+        raise OSError(errno.EIO, "lock I/O failure")
+
+    def unexpected_retry(_seconds):
+        raise AssertionError("non-contention lock failures must not be retried")
+
+    monkeypatch.setattr(approval, "_acquire_os_lock", fail_lock)
+    monkeypatch.setattr(approval.time, "sleep", unexpected_retry)
+
+    with (
+        pytest.raises(OSError) as exc_info,
+        approval._store_lock(isolated_approval_store),
+    ):
+        pass
+
+    assert exc_info.value.errno == errno.EIO
 
 
 def test_version_one_store_is_read_with_derived_contract_metadata(
