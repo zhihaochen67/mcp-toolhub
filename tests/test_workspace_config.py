@@ -543,12 +543,13 @@ def test_binding_lock_open_permission_error_is_not_retried(temp_dir, monkeypatch
         calls.append((Path(path), flags, mode))
         raise PermissionError(errno.EACCES, "denied")
 
-    monkeypatch.setattr(security_paths.os, "open", deny_open)
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(security_paths.os, "open", deny_open)
 
-    with pytest.raises(
-        StateConfigurationError, match="initialization failed"
-    ) as captured:
-        security_paths._bind_state_namespace(state_root, workspace.resolve())
+        with pytest.raises(
+            StateConfigurationError, match="initialization failed"
+        ) as captured:
+            security_paths._bind_state_namespace(state_root, workspace.resolve())
 
     assert isinstance(captured.value.__cause__, PermissionError)
     assert [call[0] for call in calls] == [state_root / "workspace-binding.json.lock"]
