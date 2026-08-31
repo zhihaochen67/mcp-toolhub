@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import errno
 import json
+import multiprocessing
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +16,7 @@ import pytest
 from mcp_toolhub.contracts import ContractOutcome
 from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
+from mcp_toolhub.security import paths as security_paths
 from mcp_toolhub.security.paths import (
     RuntimeConfigurationError,
     StateConfigurationError,
@@ -51,6 +54,101 @@ def _patch(name: str, old: str, new: str) -> str:
             tofile=f"b/{name}",
         )
     )
+
+
+def _spawn_bind_worker(
+    state_root: str,
+    workspace: str,
+    ready_queue,
+    start_event,
+    result_queue,
+) -> None:
+    """Initialize one binding in a fresh spawn-based child process."""
+    ready_queue.put(True)
+    if not start_event.wait(15):
+        result_queue.put(("unexpected", workspace, "start timeout"))
+        return
+
+    try:
+        result = security_paths._load_state_root(
+            {"TOOLHUB_STATE_ROOT": state_root},
+            Path(workspace).resolve(strict=True),
+        )
+    except StateConfigurationError as exc:
+        result_queue.put(("configuration_error", workspace, str(exc)))
+    except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover
+        result_queue.put(("unexpected", workspace, repr(exc)))
+    else:
+        result_queue.put(("success", workspace, str(result)))
+
+
+def _run_spawn_binding_race(state_root: Path, workspaces: list[Path]):
+    context = multiprocessing.get_context("spawn")
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    start_event = context.Event()
+    processes = [
+        context.Process(
+            target=_spawn_bind_worker,
+            args=(
+                str(state_root.resolve()),
+                str(workspace.resolve()),
+                ready_queue,
+                start_event,
+                result_queue,
+            ),
+        )
+        for workspace in workspaces
+    ]
+
+    try:
+        for process in processes:
+            process.start()
+        for _process in processes:
+            assert ready_queue.get(timeout=20) is True
+
+        start_event.set()
+        results = [result_queue.get(timeout=20) for _process in processes]
+        for process in processes:
+            process.join(20)
+
+        assert [process.exitcode for process in processes] == [0] * len(processes)
+        return results
+    finally:
+        start_event.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(10)
+        ready_queue.close()
+        result_queue.close()
+
+
+def _spawn_hold_binding_lock(
+    binding_path: str,
+    acquired_event,
+    release_event,
+) -> None:
+    with security_paths._binding_lock(
+        Path(binding_path),
+        timeout_seconds=10,
+    ):
+        acquired_event.set()
+        if not release_event.wait(15):
+            raise TimeoutError("test holder release timeout")
+
+
+def _spawn_binding_lock_contender(
+    binding_path: str,
+    attempting_event,
+    acquired_event,
+) -> None:
+    attempting_event.set()
+    with security_paths._binding_lock(
+        Path(binding_path),
+        timeout_seconds=10,
+    ):
+        acquired_event.set()
 
 
 def test_workspace_is_required(monkeypatch):
@@ -252,6 +350,326 @@ def test_concurrent_same_workspace_first_bind_both_succeed(temp_dir):
         results = list(executor.map(lambda _index: bind(), range(2)))
 
     assert results == [state_root.resolve(), state_root.resolve()]
+
+
+def test_spawned_same_workspace_initializers_all_succeed(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "spawn-state"
+    workspace.mkdir()
+
+    results = _run_spawn_binding_race(state_root, [workspace] * 6)
+
+    assert [result[0] for result in results] == ["success"] * 6
+    binding_paths = list(state_root.glob("workspace-binding.json"))
+    assert binding_paths == [state_root / "workspace-binding.json"]
+    payload = json.loads(binding_paths[0].read_text(encoding="utf-8"))
+    assert payload == {
+        "canonical_workspace": str(workspace.resolve()),
+        "schema_version": 1,
+    }
+    assert (state_root / "workspace-binding.json.lock").is_file()
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_spawned_different_workspace_initializers_cannot_rebind(temp_dir):
+    workspace_a = temp_dir / "workspace-a"
+    workspace_b = temp_dir / "workspace-b"
+    state_root = temp_dir / "spawn-state"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+
+    results = _run_spawn_binding_race(state_root, [workspace_a, workspace_b])
+
+    assert sorted(result[0] for result in results) == [
+        "configuration_error",
+        "success",
+    ]
+    winning_workspace = next(result[1] for result in results if result[0] == "success")
+    losing_workspace = next(
+        result[1] for result in results if result[0] == "configuration_error"
+    )
+    payload = json.loads(
+        (state_root / "workspace-binding.json").read_text(encoding="utf-8")
+    )
+    assert payload == {
+        "canonical_workspace": winning_workspace,
+        "schema_version": 1,
+    }
+
+    with pytest.raises(StateConfigurationError, match="different ToolHub workspace"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            Path(losing_workspace),
+        )
+    assert (
+        json.loads((state_root / "workspace-binding.json").read_text(encoding="utf-8"))
+        == payload
+    )
+
+
+def test_binding_lock_serializes_processes_and_remains_reusable(temp_dir):
+    state_root = temp_dir / "state"
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    lock_path = state_root / "workspace-binding.json.lock"
+    context = multiprocessing.get_context("spawn")
+    holder_acquired = context.Event()
+    holder_release = context.Event()
+    contender_attempting = context.Event()
+    contender_acquired = context.Event()
+    holder = context.Process(
+        target=_spawn_hold_binding_lock,
+        args=(str(binding_path), holder_acquired, holder_release),
+    )
+    contender = context.Process(
+        target=_spawn_binding_lock_contender,
+        args=(str(binding_path), contender_attempting, contender_acquired),
+    )
+
+    try:
+        holder.start()
+        assert holder_acquired.wait(10)
+        contender.start()
+        assert contender_attempting.wait(10)
+        assert not contender_acquired.wait(0.3)
+
+        holder_release.set()
+        assert contender_acquired.wait(10)
+        holder.join(10)
+        contender.join(10)
+        assert holder.exitcode == 0
+        assert contender.exitcode == 0
+    finally:
+        holder_release.set()
+        for process in (holder, contender):
+            if process.is_alive():
+                process.terminate()
+            process.join(10)
+
+    assert lock_path.is_file()
+    with security_paths._binding_lock(binding_path, timeout_seconds=1):
+        assert lock_path.is_file()
+    assert lock_path.is_file()
+
+
+def test_binding_lock_timeout_maps_to_path_free_configuration_error(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    context = multiprocessing.get_context("spawn")
+    holder_acquired = context.Event()
+    holder_release = context.Event()
+    holder = context.Process(
+        target=_spawn_hold_binding_lock,
+        args=(str(binding_path), holder_acquired, holder_release),
+    )
+
+    try:
+        holder.start()
+        assert holder_acquired.wait(10)
+        monkeypatch.setattr(
+            security_paths,
+            "_BINDING_LOCK_TIMEOUT_SECONDS",
+            0.1,
+        )
+
+        with pytest.raises(
+            StateConfigurationError,
+            match="initialization lock acquisition timed out",
+        ) as captured:
+            security_paths._bind_state_namespace(
+                state_root.resolve(),
+                workspace.resolve(),
+            )
+
+        assert isinstance(captured.value.__cause__, TimeoutError)
+        assert str(state_root.resolve()) not in str(captured.value)
+        assert str(workspace.resolve()) not in str(captured.value)
+    finally:
+        holder_release.set()
+        if holder.is_alive():
+            holder.join(10)
+        if holder.is_alive():
+            holder.terminate()
+        holder.join(10)
+
+    assert holder.exitcode == 0
+
+
+def test_binding_lock_is_released_when_holding_process_terminates(temp_dir):
+    state_root = temp_dir / "state"
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    lock_path = state_root / "workspace-binding.json.lock"
+    context = multiprocessing.get_context("spawn")
+    holder_acquired = context.Event()
+    never_release = context.Event()
+    holder = context.Process(
+        target=_spawn_hold_binding_lock,
+        args=(str(binding_path), holder_acquired, never_release),
+    )
+
+    holder.start()
+    try:
+        assert holder_acquired.wait(10)
+        holder.terminate()
+        holder.join(10)
+        assert not holder.is_alive()
+
+        assert lock_path.is_file()
+        with security_paths._binding_lock(binding_path, timeout_seconds=1):
+            assert lock_path.is_file()
+    finally:
+        if holder.is_alive():
+            holder.terminate()
+        holder.join(10)
+
+    assert lock_path.is_file()
+
+
+def test_binding_lock_open_permission_error_is_not_retried(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    calls = []
+
+    def deny_open(path, flags, mode=0o777):
+        calls.append((Path(path), flags, mode))
+        raise PermissionError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(security_paths.os, "open", deny_open)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert [call[0] for call in calls] == [state_root / "workspace-binding.json.lock"]
+
+
+def test_binding_lock_non_contention_error_is_not_retried(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    calls = 0
+
+    def fail_lock(_descriptor):
+        nonlocal calls
+        calls += 1
+        raise OSError(errno.EIO, "simulated lock failure")
+
+    monkeypatch.setattr(security_paths, "_acquire_binding_os_lock", fail_lock)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert calls == 1
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert (state_root / "workspace-binding.json.lock").is_file()
+
+
+def test_binding_publication_never_overwrites_manifest_that_appears(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    winner = temp_dir / "winner"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    winner.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    winner_payload = {
+        "canonical_workspace": str(winner.resolve()),
+        "schema_version": 1,
+    }
+
+    def concurrent_publish(_source, destination):
+        Path(destination).write_text(json.dumps(winner_payload), encoding="utf-8")
+        raise FileExistsError(errno.EEXIST, "binding appeared")
+
+    monkeypatch.setattr(security_paths.os, "link", concurrent_publish)
+
+    with pytest.raises(StateConfigurationError, match="different ToolHub workspace"):
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert json.loads(binding_path.read_text(encoding="utf-8")) == winner_payload
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_failed_binding_publication_cleans_temporary_file(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+
+    def fail_publish(_source, _destination):
+        raise OSError(errno.EIO, "simulated publication failure")
+
+    monkeypatch.setattr(security_paths.os, "link", fail_publish)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert not (state_root / "workspace-binding.json").exists()
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_existing_binding_symlink_fails_closed(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    target = state_root / "binding-target.json"
+    target.write_text(
+        json.dumps(
+            {
+                "canonical_workspace": str(workspace.resolve()),
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    binding_path = state_root / "workspace-binding.json"
+    try:
+        os.symlink(target, binding_path)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(StateConfigurationError, match="must not be a symlink"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+
+def test_existing_binding_non_regular_file_fails_closed(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    (state_root / "workspace-binding.json").mkdir()
+
+    with pytest.raises(StateConfigurationError, match="not a regular file"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
 
 
 def test_explicit_state_symlink_resolving_inside_workspace_fails(temp_dir, monkeypatch):

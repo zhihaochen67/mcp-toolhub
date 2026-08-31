@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import secrets
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from platformdirs import user_state_path
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 MAX_FILE_SIZE = 256 * 1024  # 256 KB
 
@@ -20,6 +28,8 @@ _BINDING_FILENAME = "workspace-binding.json"
 _BINDING_SCHEMA_VERSION = 1
 _BINDING_READ_TIMEOUT_SECONDS = 0.5
 _BINDING_READ_INTERVAL_SECONDS = 0.01
+_BINDING_LOCK_TIMEOUT_SECONDS = 5.0
+_BINDING_LOCK_RETRY_SECONDS = 0.05
 
 
 class RuntimeConfigurationError(ValueError):
@@ -199,6 +209,120 @@ def _read_binding_manifest(binding_path: Path, workspace_root: Path) -> None:
         return
 
 
+def _acquire_binding_os_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_binding_os_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _is_binding_lock_contention(exc: OSError) -> bool:
+    if os.name == "nt":
+        winerror = getattr(exc, "winerror", None)
+        if winerror is not None:
+            return winerror in {33, 36}
+    return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+
+
+@contextmanager
+def _binding_lock(
+    binding_path: Path,
+    *,
+    timeout_seconds: float | None = None,
+) -> Iterator[None]:
+    """Hold the stable OS-backed lock for one binding decision."""
+    lock_path = binding_path.with_name(binding_path.name + ".lock")
+    timeout = (
+        _BINDING_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    )
+    deadline = time.monotonic() + timeout
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(lock_path, open_flags, 0o600)
+    locked = False
+
+    try:
+        while True:
+            try:
+                _acquire_binding_os_lock(descriptor)
+                locked = True
+                break
+            except OSError as exc:
+                if not _is_binding_lock_contention(exc):
+                    raise
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Workspace binding lock acquisition timed out."
+                    ) from exc
+                time.sleep(min(_BINDING_LOCK_RETRY_SECONDS, remaining))
+
+        yield
+    finally:
+        if locked:
+            try:
+                _release_binding_os_lock(descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _publish_binding_manifest(binding_path: Path, serialized: bytes) -> None:
+    """Atomically publish a complete manifest without replacing any binding."""
+    temporary_path = binding_path.with_name(
+        f".{binding_path.name}-{secrets.token_hex(8)}.tmp"
+    )
+    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    descriptor: int | None = None
+
+    try:
+        descriptor = os.open(temporary_path, open_flags, 0o600)
+        written = 0
+        while written < len(serialized):
+            count = os.write(descriptor, serialized[written:])
+            if count <= 0:
+                raise OSError("workspace binding write made no progress")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+
+        # A hard-link publication is atomic and fails if the destination exists.
+        # Unlike os.replace (and POSIX os.rename), it can never become a rebind.
+        try:
+            os.link(temporary_path, binding_path)
+        except FileExistsError:
+            pass
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    else:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
     """Exclusively bind one trusted state namespace to one workspace."""
     binding_path = state_root / _BINDING_FILENAME
@@ -213,48 +337,21 @@ def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
     ).encode("utf-8")
 
     try:
-        descriptor = os.open(
-            binding_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-    except FileExistsError:
-        _read_binding_manifest(binding_path, workspace_root)
-        return
+        with _binding_lock(binding_path):
+            try:
+                binding_path.lstat()
+            except FileNotFoundError:
+                _publish_binding_manifest(binding_path, serialized)
+
+            _read_binding_manifest(binding_path, workspace_root)
+    except TimeoutError as exc:
+        raise StateConfigurationError(
+            "Invalid workspace binding: initialization lock acquisition timed out"
+        ) from exc
     except OSError as exc:
         raise StateConfigurationError(
-            f"Invalid workspace binding: cannot create manifest: {binding_path}"
+            "Invalid workspace binding: initialization failed"
         ) from exc
-
-    try:
-        written = 0
-        while written < len(serialized):
-            count = os.write(descriptor, serialized[written:])
-            if count <= 0:
-                raise OSError("workspace binding write made no progress")
-            written += count
-        os.fsync(descriptor)
-    except OSError as exc:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        try:
-            binding_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise StateConfigurationError(
-            f"Invalid workspace binding: cannot initialize manifest: {binding_path}"
-        ) from exc
-    else:
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            raise StateConfigurationError(
-                f"Invalid workspace binding: cannot finalize manifest: {binding_path}"
-            ) from exc
-
-    _read_binding_manifest(binding_path, workspace_root)
 
 
 def _load_state_root(
