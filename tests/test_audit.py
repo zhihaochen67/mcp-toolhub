@@ -418,8 +418,91 @@ def test_read_recent_bounded():
     assert events5[-1]["extra"]["i"] == 119
 
 
-def test_read_recent_empty_when_no_events():
-    assert audit.read_recent(limit=10) == []
+def test_read_recent_returns_requested_newest_events_oldest_to_newest(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0, 1, 2, 3)))
+
+    events = audit.read_recent(limit=2, audit_path=path)
+
+    assert [event["trace_id"] for event in events] == ["trc_2", "trc_3"]
+
+
+def test_read_recent_empty_when_audit_log_is_missing(temp_dir):
+    path = temp_dir / "missing-audit.jsonl"
+
+    assert audit.read_recent(limit=10, audit_path=path) == []
+
+
+def test_read_recent_does_not_use_path_exists_as_open_authority(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0)))
+    original_exists = Path.exists
+
+    def fail_audit_exists(candidate):
+        if candidate == path:
+            raise AssertionError("audit reads must not rely on Path.exists()")
+        return original_exists(candidate)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(Path, "exists", fail_audit_exists)
+        events = audit.read_recent(audit_path=path)
+
+    assert [event["trace_id"] for event in events] == ["trc_0"]
+
+
+def test_read_recent_open_failure_is_empty(temp_dir, monkeypatch):
+    path = temp_dir / "audit.jsonl"
+
+    def fail_open(_path, _flags):
+        raise PermissionError("simulated audit read failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit, "open_trusted_file", fail_open)
+        assert audit.read_recent(audit_path=path) == []
+
+
+def test_read_recent_skips_corrupt_and_non_object_lines(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(
+        b'{"trace_id":"valid-old"}\nnot-json\n[]\n{"trace_id":"valid-new"}\n'
+    )
+
+    events = audit.read_recent(limit=10, audit_path=path)
+
+    assert [event["trace_id"] for event in events] == ["valid-old", "valid-new"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_read_recent_tightens_existing_audit_log_permissions(temp_dir):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0)))
+    os.chmod(path, 0o666)
+
+    events = audit.read_recent(audit_path=path)
+
+    assert [event["trace_id"] for event in events] == ["trc_0"]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_read_recent_rejects_final_symlink_without_chmodding_target(temp_dir):
+    target = temp_dir / "target.jsonl"
+    path = temp_dir / "audit.jsonl"
+    target.write_bytes(b"".join(_raw_audit_lines(0)))
+    os.chmod(target, 0o644)
+    before_contents = target.read_bytes()
+    before_mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        os.symlink(target, path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    assert audit.read_recent(audit_path=path) == []
+    assert target.read_bytes() == before_contents
+    assert stat.S_IMODE(target.stat().st_mode) == before_mode
 
 
 def test_audit_recent_tool_schema_and_reads():
