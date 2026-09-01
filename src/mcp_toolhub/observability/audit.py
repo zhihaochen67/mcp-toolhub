@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_toolhub.security.paths import get_state_root
+from mcp_toolhub.security.state_permissions import open_trusted_file
 
 if os.name == "nt":
     import msvcrt
@@ -113,7 +114,7 @@ def _audit_file_lock(audit_path: Path) -> Iterator[None]:
     # lock different underlying files and both enter the critical section.
     deadline = time.monotonic() + AUDIT_LOCK_TIMEOUT_SECONDS
     open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(lock_path, open_flags, 0o600)
+    descriptor = open_trusted_file(lock_path, open_flags)
     locked = False
 
     try:
@@ -346,9 +347,14 @@ def record_event(
 
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-        with _audit_write_lock(path), open(path, "a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
+        with _audit_write_lock(path):
+            open_flags = (
+                os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = open_trusted_file(path, open_flags)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
 
         return True
 
@@ -370,7 +376,11 @@ def _scan_for_compaction(
     position = 0
 
     try:
-        with open(path, "rb") as handle:
+        descriptor = open_trusted_file(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
             while True:
                 line = handle.readline(MAX_COMPACTION_LINE_BYTES + 1)
                 if not line:
@@ -424,12 +434,21 @@ def _write_compacted_audit(
     temporary = path.parent / f".audit-{secrets.token_hex(8)}.tmp"
 
     try:
-        with open(path, "rb") as source, open(temporary, "xb") as destination:
-            source.seek(retained_offset)
-            while chunk := source.read(1024 * 1024):
-                destination.write(chunk)
-            destination.flush()
-            os.fsync(destination.fileno())
+        source_descriptor = open_trusted_file(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        with os.fdopen(source_descriptor, "rb") as source:
+            destination_descriptor = open_trusted_file(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+            )
+            with os.fdopen(destination_descriptor, "wb") as destination:
+                source.seek(retained_offset)
+                while chunk := source.read(1024 * 1024):
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
         os.replace(temporary, path)
     except BaseException:
         try:

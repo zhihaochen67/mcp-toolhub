@@ -44,6 +44,7 @@ from mcp_toolhub.contracts import (
 from mcp_toolhub.observability.audit import new_trace_id
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.risk import RiskLevel
+from mcp_toolhub.security.state_permissions import open_trusted_file
 
 if os.name == "nt":
     import msvcrt
@@ -182,7 +183,10 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
         return {}
 
     try:
-        raw = json.loads(store_path.read_text(encoding="utf-8"))
+        open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor = open_trusted_file(store_path, open_flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
     except (json.JSONDecodeError, OSError) as exc:
         raise ApprovalStoreError("Approval store is unreadable or malformed.") from exc
 
@@ -280,18 +284,24 @@ def _write_serialized_store(store_path: Path, serialized: bytes) -> None:
     tmp_path = store_path.parent / f".approvals-{secrets.token_hex(8)}.tmp"
 
     try:
-        with open(tmp_path, "xb") as handle:
+        open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        descriptor = open_trusted_file(tmp_path, open_flags)
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
 
         os.replace(tmp_path, store_path)
 
-    except BaseException:
+    except BaseException as exc:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        if isinstance(exc, OSError):
+            raise ApprovalStoreError(
+                "Approval store could not be persisted securely."
+            ) from exc
         raise
 
 
@@ -330,13 +340,23 @@ def _is_lock_contention(exc: OSError) -> bool:
 @contextmanager
 def _store_lock(store_path: Path) -> Iterator[None]:
     """Hold an OS-backed cross-process lock for one store critical section."""
-    store_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ApprovalStoreError(
+            "Approval store lock directory is unavailable."
+        ) from exc
     lock_path = store_path.with_name(store_path.name + ".lock")
     # Keep this sidecar stable: unlinking or replacing it could let contenders
     # lock different underlying files and both enter the critical section.
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
     open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(lock_path, open_flags, 0o600)
+    try:
+        descriptor = open_trusted_file(lock_path, open_flags)
+    except OSError as exc:
+        raise ApprovalStoreError(
+            "Approval store lock could not be opened securely."
+        ) from exc
     locked = False
 
     try:

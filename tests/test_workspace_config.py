@@ -277,6 +277,27 @@ def test_explicit_state_root_binds_once_to_one_workspace(temp_dir, monkeypatch):
         get_state_root()
 
 
+def test_explicit_state_root_creates_missing_parents(temp_dir):
+    workspace = temp_dir / "workspace"
+    existing_parent = temp_dir / "existing-parent"
+    missing_one = existing_parent / "missing-one"
+    missing_two = missing_one / "missing-two"
+    state_root = missing_two / "explicit-state"
+    workspace.mkdir()
+    existing_parent.mkdir()
+
+    loaded = _load_state_root(
+        {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+        workspace.resolve(),
+    )
+
+    assert loaded == state_root.resolve()
+    assert missing_one.is_dir()
+    assert missing_two.is_dir()
+    assert (state_root / "workspace-binding.json").is_file()
+    assert (state_root / "workspace-binding.json.lock").is_file()
+
+
 @pytest.mark.parametrize(
     "binding",
     [
