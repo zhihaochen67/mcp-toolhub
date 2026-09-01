@@ -130,6 +130,7 @@ _READABLE_STORE_VERSIONS = frozenset({1, STORE_VERSION})
 
 MAX_APPROVAL_RECORDS = 10_000
 MAX_APPROVAL_STORE_BYTES = 16 * 1024 * 1024
+MAX_APPROVAL_STORE_READ_BYTES = 64 * 1024 * 1024
 
 LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_RETRY_SECONDS = 0.05
@@ -188,9 +189,12 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
         raise ApprovalStoreError("Approval store is unreadable or malformed.") from exc
 
     try:
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except (json.JSONDecodeError, OSError) as exc:
+        with os.fdopen(descriptor, "rb") as handle:
+            encoded = handle.read(MAX_APPROVAL_STORE_READ_BYTES + 1)
+        if len(encoded) > MAX_APPROVAL_STORE_READ_BYTES:
+            raise ApprovalStoreError("Approval store exceeds the safe read limit.")
+        raw = json.loads(encoded.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, OSError) as exc:
         raise ApprovalStoreError("Approval store is unreadable or malformed.") from exc
 
     if not isinstance(raw, dict):
