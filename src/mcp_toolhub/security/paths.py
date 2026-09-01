@@ -31,6 +31,7 @@ MAX_FILE_SIZE = 256 * 1024  # 256 KB
 
 _BINDING_FILENAME = "workspace-binding.json"
 _BINDING_SCHEMA_VERSION = 1
+_BINDING_MAX_READ_BYTES = 256 * 1024
 _BINDING_READ_TIMEOUT_SECONDS = 0.5
 _BINDING_READ_INTERVAL_SECONDS = 0.01
 _BINDING_LOCK_TIMEOUT_SECONDS = 5.0
@@ -201,11 +202,16 @@ def _read_binding_manifest(binding_path: Path, workspace_root: Path) -> None:
                 )
             open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
             descriptor = open_trusted_file(binding_path, open_flags)
-            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+            with os.fdopen(descriptor, "rb") as handle:
+                serialized = handle.read(_BINDING_MAX_READ_BYTES + 1)
+            if len(serialized) > _BINDING_MAX_READ_BYTES:
+                raise StateConfigurationError(
+                    "Invalid workspace binding: manifest exceeds maximum size"
+                )
+            payload = json.loads(serialized.decode("utf-8"))
         except StateConfigurationError:
             raise
-        except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        except (json.JSONDecodeError, OSError, RecursionError, UnicodeError) as exc:
             if time.monotonic() < deadline:
                 time.sleep(_BINDING_READ_INTERVAL_SECONDS)
                 continue
