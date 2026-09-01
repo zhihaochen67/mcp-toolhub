@@ -216,6 +216,78 @@ def test_read_store_treats_trusted_open_file_not_found_as_empty(
         assert approval._read_store(store_path) == {}
 
 
+def test_read_store_allows_exact_byte_limit_and_rejects_one_less(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    serialized = b'{"version":2,"requests":{}}'
+    store_path.write_bytes(serialized)
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_READ_BYTES", len(serialized))
+    assert approval._read_store(store_path) == {}
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_READ_BYTES", len(serialized) - 1)
+    with pytest.raises(
+        approval.ApprovalStoreError,
+        match="Approval store exceeds the safe read limit.",
+    ):
+        approval._read_store(store_path)
+
+
+def test_read_store_rejects_one_byte_over_before_parsing_without_modification(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    read_limit = 8
+    oversized = b"sensitive"  # exactly read_limit + 1 bytes
+    store_path.write_bytes(oversized)
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_READ_BYTES", read_limit)
+
+    def fail_loads(_encoded):
+        raise AssertionError("oversized approval stores must not be parsed")
+
+    monkeypatch.setattr(approval.json, "loads", fail_loads)
+
+    with pytest.raises(
+        approval.ApprovalStoreError,
+        match="Approval store exceeds the safe read limit.",
+    ) as captured:
+        approval._read_store(store_path)
+
+    assert "sensitive" not in str(captured.value)
+    assert store_path.read_bytes() == oversized
+
+
+def test_read_store_fails_closed_for_invalid_utf8(temp_dir):
+    store_path = temp_dir / "approvals.json"
+    malformed = b'{"version":2,"requests":{}}\xff'
+    store_path.write_bytes(malformed)
+
+    with pytest.raises(approval.ApprovalStoreError) as captured:
+        approval._read_store(store_path)
+
+    assert isinstance(captured.value.__cause__, UnicodeDecodeError)
+    assert str(captured.value) == "Approval store is unreadable or malformed."
+
+
+def test_read_store_fails_closed_for_parser_recursion(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    store_path.write_bytes(b'{"version":2,"requests":{}}')
+
+    def fail_loads(_encoded):
+        raise RecursionError("simulated pathological JSON nesting")
+
+    monkeypatch.setattr(approval.json, "loads", fail_loads)
+
+    with pytest.raises(approval.ApprovalStoreError) as captured:
+        approval._read_store(store_path)
+
+    assert isinstance(captured.value.__cause__, RecursionError)
+    assert str(captured.value) == "Approval store is unreadable or malformed."
+
+
 @pytest.mark.parametrize(
     ("error_type", "error_number"),
     [
@@ -431,6 +503,20 @@ def test_existing_byte_oversized_store_refuses_additions_but_allows_transition(
     assert (
         approval.approve_request(request.request_id).status == ApprovalStatus.APPROVED
     )
+
+
+def test_read_store_is_independent_of_lowered_write_byte_quota(
+    isolated_approval_store,
+    monkeypatch,
+):
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", 1_000_000)
+    request = _create_request(payload={"content": "existing over-quota data"})
+    existing_size = len(isolated_approval_store.read_bytes())
+    assert existing_size < approval.MAX_APPROVAL_STORE_READ_BYTES
+
+    monkeypatch.setattr(approval, "MAX_APPROVAL_STORE_BYTES", existing_size - 1)
+
+    assert approval._read_store(isolated_approval_store)[request.request_id] == request
 
 
 def test_oversized_store_can_be_pruned_and_capacity_recovered(
