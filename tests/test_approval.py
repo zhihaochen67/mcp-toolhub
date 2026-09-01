@@ -6,6 +6,7 @@ import errno
 import json
 import multiprocessing
 import os
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -171,6 +172,107 @@ def test_store_is_persistent_json(isolated_approval_store):
     assert raw["requests"][request.request_id]["status"] == "PENDING"
     assert raw["requests"][request.request_id]["trace_id"] == request.trace_id
     assert raw["requests"][request.request_id]["resume_tool"] == "shell.run_approved"
+
+
+def test_read_store_returns_empty_when_store_is_missing(temp_dir):
+    store_path = temp_dir / "approvals.json"
+
+    assert approval._read_store(store_path) == {}
+
+
+def test_read_store_does_not_use_path_exists_as_open_authority(
+    isolated_approval_store,
+    monkeypatch,
+):
+    request = _create_request()
+    original_exists = Path.exists
+
+    def fail_store_exists(candidate):
+        if candidate == isolated_approval_store:
+            raise AssertionError("approval reads must not rely on Path.exists()")
+        return original_exists(candidate)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(Path, "exists", fail_store_exists)
+        requests = approval._read_store(isolated_approval_store)
+
+    assert set(requests) == {request.request_id}
+
+
+def test_read_store_treats_trusted_open_file_not_found_as_empty(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    expected_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+    def fail_open(path, flags):
+        assert path == store_path
+        assert flags == expected_flags
+        raise FileNotFoundError(errno.ENOENT, "simulated missing approval store")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval, "open_trusted_file", fail_open)
+        assert approval._read_store(store_path) == {}
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_number"),
+    [
+        pytest.param(PermissionError, errno.EACCES, id="permission-error"),
+        pytest.param(OSError, errno.EIO, id="os-error"),
+    ],
+)
+def test_read_store_fails_closed_for_other_trusted_open_errors(
+    temp_dir,
+    monkeypatch,
+    error_type,
+    error_number,
+):
+    store_path = temp_dir / "approvals.json"
+
+    def fail_open(_path, _flags):
+        raise error_type(error_number, "simulated approval read failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval, "open_trusted_file", fail_open)
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._read_store(store_path)
+
+    assert isinstance(captured.value.__cause__, error_type)
+    assert captured.value.__cause__.errno == error_number
+    assert str(captured.value) == "Approval store is unreadable or malformed."
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_read_store_tightens_existing_store_permissions(temp_dir):
+    store_path = temp_dir / "approvals.json"
+    store_path.write_text('{"version": 2, "requests": {}}', encoding="utf-8")
+    os.chmod(store_path, 0o666)
+
+    assert approval._read_store(store_path) == {}
+    assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_read_store_rejects_final_component_symlink(temp_dir):
+    target = temp_dir / "target.json"
+    store_path = temp_dir / "approvals.json"
+    target.write_text('{"version": 2, "requests": {}}', encoding="utf-8")
+    os.chmod(target, 0o644)
+    before_contents = target.read_bytes()
+    before_mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        os.symlink(target, store_path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(approval.ApprovalStoreError) as captured:
+        approval._read_store(store_path)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert target.read_bytes() == before_contents
+    assert stat.S_IMODE(target.stat().st_mode) == before_mode
 
 
 def test_record_capacity_allows_exact_limit_and_refuses_one_over_unchanged(

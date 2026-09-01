@@ -179,12 +179,15 @@ def _new_request_id() -> str:
 def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
     """Read the store without locking. Atomic replace guarantees a reader sees
     either the old or the new file, never a torn write."""
-    if not store_path.exists():
+    open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = open_trusted_file(store_path, open_flags)
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise ApprovalStoreError("Approval store is unreadable or malformed.") from exc
 
     try:
-        open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        descriptor = open_trusted_file(store_path, open_flags)
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except (json.JSONDecodeError, OSError) as exc:
