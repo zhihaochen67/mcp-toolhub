@@ -323,6 +323,142 @@ def test_explicit_state_root_malformed_binding_fails_closed(
         get_state_root()
 
 
+def test_binding_read_accepts_exact_byte_boundary_and_rejects_one_less(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    serialized = (
+        json.dumps(
+            {
+                "canonical_workspace": str(workspace.resolve()),
+                "schema_version": 1,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    binding_path.write_bytes(serialized)
+
+    monkeypatch.setattr(
+        security_paths,
+        "_BINDING_MAX_READ_BYTES",
+        len(serialized),
+    )
+    security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+    monkeypatch.setattr(
+        security_paths,
+        "_BINDING_MAX_READ_BYTES",
+        len(serialized) - 1,
+    )
+    with pytest.raises(StateConfigurationError, match="exceeds maximum size"):
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+
+def test_binding_read_rejects_one_byte_over_without_modifying_input(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    limit = 32
+    serialized = b"x" * (limit + 1)
+    binding_path.write_bytes(serialized)
+    monkeypatch.setattr(security_paths, "_BINDING_MAX_READ_BYTES", limit)
+
+    with pytest.raises(StateConfigurationError, match="exceeds maximum size"):
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+    assert binding_path.read_bytes() == serialized
+
+
+def test_oversized_binding_is_rejected_before_json_parsing(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    limit = 16
+    binding_path.write_bytes(b"x" * (limit + 1))
+    monkeypatch.setattr(security_paths, "_BINDING_MAX_READ_BYTES", limit)
+
+    def fail_if_called(_serialized):
+        raise AssertionError("json.loads must not parse an oversized binding")
+
+    monkeypatch.setattr(security_paths.json, "loads", fail_if_called)
+
+    with pytest.raises(StateConfigurationError, match="exceeds maximum size"):
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+
+def test_binding_read_invalid_utf8_fails_closed(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    binding_path.write_bytes(b"\xff")
+    monkeypatch.setattr(security_paths, "_BINDING_READ_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(
+        StateConfigurationError,
+        match="manifest is unreadable or malformed",
+    ) as captured:
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, UnicodeDecodeError)
+
+
+def test_binding_read_parser_recursion_fails_closed(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    binding_path.write_bytes(b"{}")
+    monkeypatch.setattr(security_paths, "_BINDING_READ_TIMEOUT_SECONDS", 0)
+
+    def recurse(_serialized):
+        raise RecursionError("simulated parser recursion")
+
+    monkeypatch.setattr(security_paths.json, "loads", recurse)
+
+    with pytest.raises(
+        StateConfigurationError,
+        match="manifest is unreadable or malformed",
+    ) as captured:
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, RecursionError)
+
+
+def test_binding_read_parser_memory_error_is_not_swallowed(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    binding_path.write_bytes(b"{}")
+
+    def exhaust_memory(_serialized):
+        raise MemoryError("simulated parser exhaustion")
+
+    monkeypatch.setattr(security_paths.json, "loads", exhaust_memory)
+
+    with pytest.raises(MemoryError, match="simulated parser exhaustion"):
+        security_paths._read_binding_manifest(binding_path, workspace.resolve())
+
+
 def test_concurrent_explicit_first_bind_allows_only_one_workspace(temp_dir):
     workspace_a = temp_dir / "workspace-a"
     workspace_b = temp_dir / "workspace-b"
