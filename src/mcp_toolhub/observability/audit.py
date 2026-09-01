@@ -515,7 +515,11 @@ def _read_last_lines(path: Path, limit: int) -> list[str]:
     lines: list[str] = []
 
     try:
-        with open(path, "rb") as handle:
+        descriptor = open_trusted_file(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
 
@@ -561,9 +565,6 @@ def read_recent(
     """
     limit = max(1, min(int(limit), MAX_READ_EVENTS))
     path = audit_path or _default_audit_path()
-
-    if not path.exists():
-        return []
 
     events: list[dict[str, Any]] = []
 
