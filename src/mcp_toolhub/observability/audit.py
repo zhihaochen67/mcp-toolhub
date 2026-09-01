@@ -50,6 +50,7 @@ MAX_READ_EVENTS = 100
 MAX_READ_BYTES = 1_000_000
 MAX_COMPACTION_EVENTS = 100_000
 MAX_COMPACTION_LINE_BYTES = 1_000_000
+MAX_COMPACTION_READ_BYTES = 64 * 1024 * 1024
 
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 _AUDIT_LOCK_RETRY_SECONDS = 0.05
@@ -368,9 +369,6 @@ def _scan_for_compaction(
     keep_last: int,
 ) -> _AuditScan:
     """Validate the complete JSONL file and locate the retained byte suffix."""
-    if not path.exists():
-        return _AuditScan(total=0, retained=0, retained_offset=0)
-
     offsets: deque[int] = deque(maxlen=max(1, keep_last))
     total = 0
     position = 0
@@ -380,11 +378,28 @@ def _scan_for_compaction(
             path,
             os.O_RDONLY | getattr(os, "O_BINARY", 0),
         )
+    except FileNotFoundError:
+        return _AuditScan(total=0, retained=0, retained_offset=0)
+    except OSError as exc:
+        raise AuditMaintenanceError("Audit log could not be read safely.") from exc
+
+    try:
         with os.fdopen(descriptor, "rb") as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_COMPACTION_READ_BYTES:
+                raise AuditMaintenanceError(
+                    "Audit log exceeds the safe compaction read limit."
+                )
+
+            read_bytes = 0
             while True:
                 line = handle.readline(MAX_COMPACTION_LINE_BYTES + 1)
                 if not line:
                     break
+                read_bytes += len(line)
+                if read_bytes > MAX_COMPACTION_READ_BYTES:
+                    raise AuditMaintenanceError(
+                        "Audit log exceeds the safe compaction read limit."
+                    )
                 if len(line) > MAX_COMPACTION_LINE_BYTES:
                     raise AuditMaintenanceError(
                         "Audit log contains an oversized or incomplete event."

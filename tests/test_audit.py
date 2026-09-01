@@ -718,6 +718,164 @@ def test_audit_compaction_missing_file_is_noop(temp_dir):
     assert path.exists() is False
 
 
+def test_audit_compaction_missing_file_is_only_file_not_found(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "missing-audit.jsonl"
+    expected_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+    def fail_open(candidate, flags):
+        assert candidate == path
+        assert flags == expected_flags
+        raise FileNotFoundError("simulated missing audit log")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit, "open_trusted_file", fail_open)
+        result = audit.compact_audit(10, audit_path=path)
+
+    assert result.total == result.removed == result.retained == 0
+    assert result.changed is False
+
+
+def test_audit_compaction_does_not_use_path_exists_as_open_authority(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    path.write_bytes(b"".join(_raw_audit_lines(0)))
+    original_exists = Path.exists
+
+    def fail_audit_exists(candidate):
+        if candidate == path:
+            raise AssertionError("compaction reads must not rely on Path.exists()")
+        return original_exists(candidate)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(Path, "exists", fail_audit_exists)
+        result = audit.compact_audit(1, audit_path=path)
+
+    assert result.total == result.retained == 1
+    assert result.removed == 0
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        PermissionError("simulated audit permission failure"),
+        OSError("simulated generic audit read failure"),
+    ],
+)
+def test_audit_compaction_open_failures_fail_closed(
+    temp_dir,
+    monkeypatch,
+    read_error,
+):
+    path = temp_dir / "audit.jsonl"
+
+    def fail_open(_path, _flags):
+        raise read_error
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit, "open_trusted_file", fail_open)
+        with pytest.raises(
+            audit.AuditMaintenanceError,
+            match="could not be read safely",
+        ):
+            audit.compact_audit(1, audit_path=path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_audit_compaction_rejects_final_symlink_without_chmodding_target(temp_dir):
+    target = temp_dir / "target.jsonl"
+    path = temp_dir / "audit.jsonl"
+    target.write_bytes(b"".join(_raw_audit_lines(0)))
+    os.chmod(target, 0o644)
+    before_contents = target.read_bytes()
+    before_mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        os.symlink(target, path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(audit.AuditMaintenanceError, match="read safely"):
+        audit.compact_audit(1, audit_path=path)
+
+    assert target.read_bytes() == before_contents
+    assert stat.S_IMODE(target.stat().st_mode) == before_mode
+
+
+def test_audit_compaction_allows_exact_total_byte_limit(temp_dir, monkeypatch):
+    path = temp_dir / "audit.jsonl"
+    serialized = b"".join(_raw_audit_lines(0, 1))
+    path.write_bytes(serialized)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            audit,
+            "MAX_COMPACTION_READ_BYTES",
+            len(serialized),
+        )
+        result = audit.compact_audit(1, audit_path=path)
+
+    assert result.total == 2
+    assert result.retained == 1
+    assert result.removed == 1
+    assert result.changed is False
+
+
+def test_audit_compaction_rejects_one_byte_over_total_limit(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    marker = "sensitive-audit-contents"
+    serialized = (json.dumps({"event": marker}, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    path.write_bytes(serialized)
+    result = None
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            audit,
+            "MAX_COMPACTION_READ_BYTES",
+            len(serialized) - 1,
+        )
+        with pytest.raises(audit.AuditMaintenanceError) as captured:
+            result = audit.compact_audit(1, audit_path=path)
+
+    assert result is None
+    assert marker not in str(captured.value)
+    assert str(path) not in str(captured.value)
+    assert path.read_bytes() == serialized
+
+
+def test_audit_compaction_rejects_oversized_total_before_json_parsing(
+    temp_dir,
+    monkeypatch,
+):
+    path = temp_dir / "audit.jsonl"
+    read_limit = 32
+    path.write_bytes(b"x" * (read_limit + 1))
+
+    def fail_loads(_line):
+        raise AssertionError("oversized compaction input must not be parsed")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            audit,
+            "MAX_COMPACTION_READ_BYTES",
+            read_limit,
+        )
+        scoped_monkeypatch.setattr(audit.json, "loads", fail_loads)
+        with pytest.raises(
+            audit.AuditMaintenanceError,
+            match="safe compaction read limit",
+        ):
+            audit.compact_audit(1, audit_path=path)
+
+
 @pytest.mark.parametrize("keep_last", [-1, audit.MAX_COMPACTION_EVENTS + 1])
 def test_audit_compaction_invalid_limit_does_not_mutate(temp_dir, keep_last):
     path = temp_dir / "audit.jsonl"
