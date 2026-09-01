@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import multiprocessing
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -511,24 +512,30 @@ def test_store_lock_is_released_when_owner_process_terminates(
             process.join(timeout=10)
 
 
-def test_store_lock_propagates_sidecar_permission_failure(
+def test_store_lock_wraps_sidecar_permission_failure(
     isolated_approval_store,
     monkeypatch,
 ):
+    original_open = os.open
+
     def deny_open(*_args, **_kwargs):
         raise PermissionError(errno.EACCES, "access denied")
 
     def unexpected_retry(_seconds):
         raise AssertionError("sidecar permission failures must not be retried")
 
-    monkeypatch.setattr(approval.os, "open", deny_open)
-    monkeypatch.setattr(approval.time, "sleep", unexpected_retry)
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.os, "open", deny_open)
+        scoped_monkeypatch.setattr(approval.time, "sleep", unexpected_retry)
 
-    with (
-        pytest.raises(PermissionError),
-        approval._store_lock(isolated_approval_store),
-    ):
-        pass
+        with (
+            pytest.raises(approval.ApprovalStoreError) as captured,
+            approval._store_lock(isolated_approval_store),
+        ):
+            pass
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert os.open is original_open
 
 
 def test_store_lock_propagates_non_contention_lock_error(

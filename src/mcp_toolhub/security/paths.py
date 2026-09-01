@@ -17,6 +17,11 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from platformdirs import user_state_path
 
+from mcp_toolhub.security.state_permissions import (
+    open_trusted_file,
+    secure_trusted_directory,
+)
+
 if os.name == "nt":
     import msvcrt
 else:
@@ -194,7 +199,10 @@ def _read_binding_manifest(binding_path: Path, workspace_root: Path) -> None:
                 raise StateConfigurationError(
                     "Invalid workspace binding: manifest is not a regular file"
                 )
-            payload = json.loads(binding_path.read_text(encoding="utf-8"))
+            open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            descriptor = open_trusted_file(binding_path, open_flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
         except StateConfigurationError:
             raise
         except (json.JSONDecodeError, OSError, UnicodeError) as exc:
@@ -246,7 +254,7 @@ def _binding_lock(
     )
     deadline = time.monotonic() + timeout
     open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(lock_path, open_flags, 0o600)
+    descriptor = open_trusted_file(lock_path, open_flags)
     locked = False
 
     try:
@@ -288,7 +296,7 @@ def _publish_binding_manifest(binding_path: Path, serialized: bytes) -> None:
     descriptor: int | None = None
 
     try:
-        descriptor = os.open(temporary_path, open_flags, 0o600)
+        descriptor = open_trusted_file(temporary_path, open_flags)
         written = 0
         while written < len(serialized):
             count = os.write(descriptor, serialized[written:])
@@ -354,6 +362,101 @@ def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
         ) from exc
 
 
+def _ensure_directory_component(
+    parent: Path,
+    name: str,
+    *,
+    secure_existing: bool,
+) -> Path:
+    """Create and secure one component, optionally tightening an existing one."""
+    if not name or Path(name).name != name:
+        raise OSError(errno.EINVAL, "invalid ToolHub state directory component")
+
+    path = parent / name
+    creation_mode = 0o777 if os.name == "nt" else 0o700
+    created = True
+    try:
+        os.mkdir(path, creation_mode)
+    except FileExistsError:
+        created = False
+
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError(
+            errno.ELOOP,
+            "ToolHub state directory must not be a symlink",
+            os.fspath(path),
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            "ToolHub state path is not a directory",
+            os.fspath(path),
+        )
+
+    if created or secure_existing:
+        # POSIX securing reopens the exact final component with O_NOFOLLOW
+        # before chmod. The lstat above provides a clear cross-platform type
+        # error but is not used as chmod authority.
+        secure_trusted_directory(path)
+    return path
+
+
+def _secure_toolhub_directory(parent: Path, name: str) -> Path:
+    """Create or validate one ToolHub-owned directory below ``parent``."""
+    return _ensure_directory_component(parent, name, secure_existing=True)
+
+
+def _existing_external_state_parent(path: Path) -> Path:
+    """Resolve an existing non-ToolHub parent without changing its mode."""
+    try:
+        parent = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError(
+            errno.ENOENT,
+            "trusted state parent does not exist or cannot be resolved",
+            os.fspath(path),
+        ) from exc
+    if not parent.is_dir():
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            "trusted state parent is not a directory",
+            os.fspath(parent),
+        )
+    return parent
+
+
+def _ensure_directory_chain(target: Path) -> Path:
+    """Securely create each missing component below the deepest existing parent."""
+    missing_components: list[str] = []
+    ancestor = target
+
+    while True:
+        try:
+            ancestor.lstat()
+        except FileNotFoundError:
+            parent = ancestor.parent
+            if parent == ancestor or not ancestor.name:
+                raise OSError(
+                    errno.ENOENT,
+                    "trusted state path has no existing ancestor",
+                    os.fspath(target),
+                )
+            missing_components.append(ancestor.name)
+            ancestor = parent
+            continue
+        break
+
+    current = _existing_external_state_parent(ancestor)
+    for name in reversed(missing_components):
+        current = _ensure_directory_component(
+            current,
+            name,
+            secure_existing=False,
+        )
+    return current
+
+
 def _load_state_root(
     environment: Mapping[str, str],
     workspace_root: Path,
@@ -386,11 +489,31 @@ def _load_state_root(
         )
 
     try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        state_root = candidate.resolve(strict=True)
+        if value is None:
+            external_parent = _ensure_directory_chain(base.parent)
+            toolhub_root = _secure_toolhub_directory(external_parent, base.name)
+            workspaces_root = _secure_toolhub_directory(toolhub_root, "workspaces")
+            state_directory = _secure_toolhub_directory(
+                workspaces_root,
+                _workspace_identifier(workspace_root),
+            )
+        else:
+            if not candidate.name:
+                raise OSError(
+                    errno.EINVAL,
+                    "TOOLHUB_STATE_ROOT must name a ToolHub-owned directory",
+                )
+            external_parent = _ensure_directory_chain(candidate.parent)
+            state_directory = _secure_toolhub_directory(
+                external_parent,
+                candidate.name,
+            )
+
+        state_root = state_directory.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise StateConfigurationError(
-            "Invalid TOOLHUB_STATE_ROOT: path cannot be created or resolved: "
+            "Invalid TOOLHUB_STATE_ROOT: path cannot be created, resolved, or "
+            "secured: "
             f"{candidate}"
         ) from exc
 
@@ -447,6 +570,12 @@ def _validate_supplied_configuration(configuration: RuntimeConfiguration) -> Non
             "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
             "TOOLHUB_WORKSPACE_ROOT"
         )
+    try:
+        secure_trusted_directory(state_root)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeConfigurationError(
+            "Supplied runtime configuration state root could not be secured"
+        ) from exc
 
 
 def initialize_runtime_configuration(
