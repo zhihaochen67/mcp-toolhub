@@ -555,61 +555,86 @@ def _is_state_temporary_name(name: str) -> bool:
 
 def _inspect_state_directory(state_root: Path, workspace_root: Path) -> None:
     """Validate an existing state namespace without adopting unknown objects."""
-    try:
-        root_info = state_root.lstat()
-        if stat.S_ISLNK(root_info.st_mode):
-            raise OSError(
-                errno.ELOOP,
-                "trusted state root must not be a symlink",
-                os.fspath(state_root),
-            )
-        if not stat.S_ISDIR(root_info.st_mode):
-            raise NotADirectoryError(
-                errno.ENOTDIR,
-                "trusted state root is not a directory",
-                os.fspath(state_root),
-            )
+    deadline = time.monotonic() + _BINDING_READ_TIMEOUT_SECONDS
 
-        with os.scandir(state_root) as iterator:
-            entries = {entry.name: entry for entry in iterator}
-    except (OSError, RuntimeError) as exc:
-        raise StateConfigurationError(
-            "Invalid TOOLHUB_STATE_ROOT: existing state cannot be inspected safely"
-        ) from exc
-
-    known_names = {
-        name
-        for name in entries
-        if name in _STATE_REGULAR_FILENAMES or _is_state_temporary_name(name)
-    }
-    for name in sorted(known_names):
-        entry = entries[name]
+    while True:
         try:
-            info = entry.stat(follow_symlinks=False)
-        except OSError as exc:
+            root_info = state_root.lstat()
+            if stat.S_ISLNK(root_info.st_mode):
+                raise OSError(
+                    errno.ELOOP,
+                    "trusted state root must not be a symlink",
+                    os.fspath(state_root),
+                )
+            if not stat.S_ISDIR(root_info.st_mode):
+                raise NotADirectoryError(
+                    errno.ENOTDIR,
+                    "trusted state root is not a directory",
+                    os.fspath(state_root),
+                )
+
+            with os.scandir(state_root) as iterator:
+                entries = {entry.name: entry for entry in iterator}
+        except (OSError, RuntimeError) as exc:
             raise StateConfigurationError(
-                "Invalid TOOLHUB_STATE_ROOT: state object cannot be inspected safely"
+                "Invalid TOOLHUB_STATE_ROOT: existing state cannot be inspected safely"
             ) from exc
-        if stat.S_ISLNK(info.st_mode):
+
+        known_names = {
+            name
+            for name in entries
+            if name in _STATE_REGULAR_FILENAMES or _is_state_temporary_name(name)
+        }
+        transient_disappeared = False
+        for name in sorted(known_names):
+            entry = entries[name]
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError as exc:
+                if not _is_state_temporary_name(name):
+                    raise StateConfigurationError(
+                        "Invalid TOOLHUB_STATE_ROOT: state object cannot be "
+                        "inspected safely"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise StateConfigurationError(
+                        "Invalid TOOLHUB_STATE_ROOT: state changed repeatedly "
+                        "during inspection"
+                    ) from exc
+                transient_disappeared = True
+                break
+            except OSError as exc:
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object cannot be inspected safely"
+                ) from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object must not be a "
+                    f"symlink: {name}"
+                )
+            if not stat.S_ISREG(info.st_mode):
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object is not a regular "
+                    f"file: {name}"
+                )
+
+        if transient_disappeared:
+            remaining = max(0.0, deadline - time.monotonic())
+            time.sleep(min(_BINDING_READ_INTERVAL_SECONDS, remaining))
+            continue
+
+        unexpected_names = sorted(set(entries) - known_names)
+        if unexpected_names:
             raise StateConfigurationError(
-                f"Invalid TOOLHUB_STATE_ROOT: state object must not be a symlink: {name}"
-            )
-        if not stat.S_ISREG(info.st_mode):
-            raise StateConfigurationError(
-                f"Invalid TOOLHUB_STATE_ROOT: state object is not a regular file: {name}"
+                "Invalid TOOLHUB_STATE_ROOT: unexpected state object: "
+                f"{unexpected_names[0]}"
             )
 
-    unexpected_names = sorted(set(entries) - known_names)
-    if unexpected_names:
-        raise StateConfigurationError(
-            "Invalid TOOLHUB_STATE_ROOT: unexpected state object: "
-            f"{unexpected_names[0]}"
-        )
+        if _BINDING_FILENAME not in entries:
+            return
 
-    if _BINDING_FILENAME not in entries:
+        _read_binding_manifest(state_root / _BINDING_FILENAME, workspace_root)
         return
-
-    _read_binding_manifest(state_root / _BINDING_FILENAME, workspace_root)
 
 
 def _inspect_existing_state_candidate(

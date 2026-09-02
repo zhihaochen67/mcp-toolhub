@@ -327,6 +327,99 @@ def test_empty_existing_state_root_initializes_and_remains_stable(temp_dir):
     ]
 
 
+def test_state_discovery_retries_when_internal_temporary_disappears(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    original_scandir = security_paths.os.scandir
+    scans = 0
+
+    class DisappearedTemporary:
+        name = ".workspace-binding.json-concurrent.tmp"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError(errno.ENOENT, "concurrent temporary removed")
+
+    class TransientSnapshot:
+        def __enter__(self):
+            return iter([DisappearedTemporary()])
+
+        def __exit__(self, *_args):
+            return False
+
+    def transient_scandir(path):
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            return TransientSnapshot()
+        return original_scandir(path)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(security_paths.os, "scandir", transient_scandir)
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "_BINDING_READ_INTERVAL_SECONDS",
+            0,
+        )
+        loaded = _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    assert scans >= 2
+    assert loaded == state_root.resolve()
+    assert (state_root / "workspace-binding.json").is_file()
+
+
+def test_state_discovery_does_not_retry_disappeared_persistent_object(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    scans = 0
+
+    class DisappearedApprovalStore:
+        name = "approvals.json"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError(errno.ENOENT, "persistent state disappeared")
+
+    class InvalidSnapshot:
+        def __enter__(self):
+            return iter([DisappearedApprovalStore()])
+
+        def __exit__(self, *_args):
+            return False
+
+    def invalid_scandir(_path):
+        nonlocal scans
+        scans += 1
+        return InvalidSnapshot()
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(security_paths.os, "scandir", invalid_scandir)
+        with pytest.raises(
+            StateConfigurationError,
+            match="state object cannot be inspected safely",
+        ):
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+    assert scans == 1
+    assert not (state_root / "workspace-binding.json").exists()
+
+
 def test_known_existing_state_is_preserved_during_initial_binding(temp_dir):
     workspace = temp_dir / "workspace"
     state_root = temp_dir / "state"
