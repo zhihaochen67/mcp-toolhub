@@ -273,43 +273,136 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
 
 def _serialize_store(requests: dict[str, ApprovalRequest]) -> bytes:
     """Return the complete deterministic UTF-8 representation persisted to disk."""
-    payload = {
-        "version": STORE_VERSION,
-        "requests": {
-            request_id: request.model_dump(mode="json")
-            for request_id, request in sorted(requests.items())
-        },
-    }
+    try:
+        payload = {
+            "version": STORE_VERSION,
+            "requests": {
+                request_id: request.model_dump(mode="json")
+                for request_id, request in sorted(requests.items())
+            },
+        }
 
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    except Exception as exc:
+        raise ApprovalStoreError("Approval store could not be serialized.") from exc
+
+
+def _open_replacement_target(store_path: Path) -> int | None:
+    """Open an existing POSIX publication target without following a symlink."""
+    if os.name != "posix":
+        return None
+
+    open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        return open_trusted_file(store_path, open_flags)
+    except FileNotFoundError:
+        return None
+
+
+def _open_matching_replacement_target(
+    store_path: Path,
+    expected_descriptor: int | None,
+) -> int | None:
+    """Reject a POSIX target that appeared or changed while the temp was written."""
+    descriptor = _open_replacement_target(store_path)
+    try:
+        if expected_descriptor is None:
+            if descriptor is not None:
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "approval store target appeared during publication",
+                    os.fspath(store_path),
+                )
+            return None
+
+        if descriptor is None:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "approval store target disappeared during publication",
+                os.fspath(store_path),
+            )
+
+        expected = os.fstat(expected_descriptor)
+        current = os.fstat(descriptor)
+        if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError(
+                getattr(errno, "ESTALE", errno.EIO),
+                "approval store target changed during publication",
+                os.fspath(store_path),
+            )
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+    return descriptor
 
 
 def _write_serialized_store(store_path: Path, serialized: bytes) -> None:
     """Atomically persist one already-serialized store representation."""
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-
     tmp_path = store_path.parent / f".approvals-{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    target_descriptor: int | None = None
+    publication_descriptor: int | None = None
+    temporary_creation_attempted = False
+    temporary_created = False
 
     try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        target_descriptor = _open_replacement_target(store_path)
         open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        temporary_creation_attempted = True
         descriptor = open_trusted_file(tmp_path, open_flags)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
+        temporary_created = True
+        written = 0
+        while written < len(serialized):
+            count = os.write(descriptor, serialized[written:])
+            if count <= 0:
+                raise OSError(errno.EIO, "approval store write made no progress")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
 
+        publication_descriptor = _open_matching_replacement_target(
+            store_path,
+            target_descriptor,
+        )
         os.replace(tmp_path, store_path)
 
     except BaseException as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        if isinstance(exc, OSError):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_created or (
+            temporary_creation_attempted
+            and not (isinstance(exc, OSError) and exc.errno == errno.EEXIST)
+        ):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if isinstance(exc, Exception):
             raise ApprovalStoreError(
                 "Approval store could not be persisted securely."
             ) from exc
         raise
+    finally:
+        if target_descriptor is not None:
+            try:
+                os.close(target_descriptor)
+            except OSError:
+                pass
+        if publication_descriptor is not None:
+            try:
+                os.close(publication_descriptor)
+            except OSError:
+                pass
 
 
 def _write_store(

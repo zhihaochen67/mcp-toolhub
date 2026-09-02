@@ -174,6 +174,247 @@ def test_store_is_persistent_json(isolated_approval_store):
     assert raw["requests"][request.request_id]["resume_tool"] == "shell.run_approved"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_temporary_store_file_is_private_before_publication(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    original_replace = approval.os.replace
+    observed_modes = []
+
+    def inspect_replacement(source, destination):
+        assert Path(destination) == store_path
+        observed_modes.append(stat.S_IMODE(Path(source).stat().st_mode))
+        return original_replace(source, destination)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.os, "replace", inspect_replacement)
+        approval._write_serialized_store(
+            store_path,
+            b'{"version": 2, "requests": {}}',
+        )
+
+    assert observed_modes == [0o600]
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_successful_write_publishes_private_store(temp_dir):
+    store_path = temp_dir / "approvals.json"
+
+    approval._write_serialized_store(
+        store_path,
+        b'{"version": 2, "requests": {}}',
+    )
+
+    assert stat.S_IMODE(store_path.stat().st_mode) == 0o600
+
+
+def test_failed_write_leaves_previous_store_unchanged(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+
+    def fail_write(_descriptor, _data):
+        raise OSError(errno.EIO, "simulated approval write failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.os, "write", fail_write)
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_fsync_failure_leaves_previous_store_unchanged(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+
+    def fail_fsync(_descriptor):
+        raise OSError(errno.EIO, "simulated approval fsync failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.os, "fsync", fail_fsync)
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_replacement_failure_leaves_previous_store_unchanged(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+
+    def fail_replace(_source, _destination):
+        raise OSError(errno.EIO, "simulated approval replacement failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.os, "replace", fail_replace)
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_temporary_creation_failure_leaves_previous_store_unchanged(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+    trusted_open = approval.open_trusted_file
+
+    def fail_temporary_creation(path, flags, mode=0o600):
+        if Path(path).suffix == ".tmp":
+            raise PermissionError(errno.EACCES, "simulated temp creation failure")
+        return trusted_open(path, flags, mode)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            approval,
+            "open_trusted_file",
+            fail_temporary_creation,
+        )
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert captured.value.__cause__.errno == errno.EACCES
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_temporary_name_collision_does_not_remove_unrelated_file(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    unrelated = temp_dir / ".approvals-collision.tmp"
+    unrelated.write_bytes(b"unrelated")
+    monkeypatch.setattr(approval.secrets, "token_hex", lambda _length: "collision")
+
+    with pytest.raises(approval.ApprovalStoreError) as captured:
+        approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, FileExistsError)
+    assert unrelated.read_bytes() == b"unrelated"
+    assert not store_path.exists()
+
+
+def test_temporary_permission_failure_is_wrapped_and_cleans_up(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+    trusted_open = approval.open_trusted_file
+
+    def fail_temporary_permissions(path, flags, mode=0o600):
+        if Path(path).suffix == ".tmp":
+            descriptor = trusted_open(path, flags, mode)
+            os.close(descriptor)
+            raise PermissionError(errno.EACCES, "simulated permission failure")
+        return trusted_open(path, flags, mode)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            approval,
+            "open_trusted_file",
+            fail_temporary_permissions,
+        )
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert captured.value.__cause__.errno == errno.EACCES
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_serialization_failure_leaves_previous_store_unchanged(temp_dir, monkeypatch):
+    store_path = temp_dir / "approvals.json"
+    original = b"previous approval store"
+    store_path.write_bytes(original)
+
+    def fail_serialization(*_args, **_kwargs):
+        raise TypeError("simulated serialization failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(approval.json, "dumps", fail_serialization)
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_store(store_path, {})
+
+    assert isinstance(captured.value.__cause__, TypeError)
+    assert store_path.read_bytes() == original
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX replacement identity semantics")
+def test_write_rejects_unrelated_target_that_appears_before_publication(
+    temp_dir,
+    monkeypatch,
+):
+    store_path = temp_dir / "approvals.json"
+    original_fsync = approval.os.fsync
+
+    def publish_unrelated_target(descriptor):
+        original_fsync(descriptor)
+        store_path.write_bytes(b"unrelated")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            approval.os,
+            "fsync",
+            publish_unrelated_target,
+        )
+        with pytest.raises(approval.ApprovalStoreError) as captured:
+            approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, FileExistsError)
+    assert store_path.read_bytes() == b"unrelated"
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_write_rejects_final_component_symlink(temp_dir):
+    target = temp_dir / "target.json"
+    store_path = temp_dir / "approvals.json"
+    original = b"unrelated target"
+    target.write_bytes(original)
+    os.chmod(target, 0o644)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        os.symlink(target, store_path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(approval.ApprovalStoreError) as captured:
+        approval._write_serialized_store(store_path, b"replacement")
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert store_path.is_symlink()
+    assert target.read_bytes() == original
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
+
+
+def test_approval_write_path_does_not_change_process_umask():
+    source = Path(approval.__file__).read_text(encoding="utf-8")
+
+    assert "os.umask(" not in source
+
+
 def test_read_store_returns_empty_when_store_is_missing(temp_dir):
     store_path = temp_dir / "approvals.json"
 
