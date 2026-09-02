@@ -20,6 +20,7 @@ from mcp_toolhub.observability import audit
 from mcp_toolhub.security import approval
 from mcp_toolhub.security import paths as security_paths
 from mcp_toolhub.security.paths import (
+    RuntimeConfiguration,
     RuntimeConfigurationError,
     StateConfigurationError,
     WorkspaceConfigurationError,
@@ -298,6 +299,408 @@ def test_explicit_state_root_creates_missing_parents(temp_dir):
     assert missing_two.is_dir()
     assert (state_root / "workspace-binding.json").is_file()
     assert (state_root / "workspace-binding.json.lock").is_file()
+
+
+def test_empty_existing_state_root_initializes_and_remains_stable(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+
+    loaded = _load_state_root(
+        {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+        workspace.resolve(),
+    )
+    binding_path = state_root / "workspace-binding.json"
+    original = binding_path.read_bytes()
+
+    reloaded = _load_state_root(
+        {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+        workspace.resolve(),
+    )
+
+    assert loaded == reloaded == state_root.resolve()
+    assert binding_path.read_bytes() == original
+    assert sorted(path.name for path in state_root.iterdir()) == [
+        "workspace-binding.json",
+        "workspace-binding.json.lock",
+    ]
+
+
+def test_state_discovery_retries_when_internal_temporary_disappears(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    original_scandir = security_paths.os.scandir
+    scans = 0
+
+    class DisappearedTemporary:
+        name = ".workspace-binding.json-concurrent.tmp"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError(errno.ENOENT, "concurrent temporary removed")
+
+    class TransientSnapshot:
+        def __enter__(self):
+            return iter([DisappearedTemporary()])
+
+        def __exit__(self, *_args):
+            return False
+
+    def transient_scandir(path):
+        nonlocal scans
+        scans += 1
+        if scans == 1:
+            return TransientSnapshot()
+        return original_scandir(path)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(security_paths.os, "scandir", transient_scandir)
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "_BINDING_READ_INTERVAL_SECONDS",
+            0,
+        )
+        loaded = _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    assert scans >= 2
+    assert loaded == state_root.resolve()
+    assert (state_root / "workspace-binding.json").is_file()
+
+
+def test_state_discovery_does_not_retry_disappeared_persistent_object(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    scans = 0
+
+    class DisappearedApprovalStore:
+        name = "approvals.json"
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise FileNotFoundError(errno.ENOENT, "persistent state disappeared")
+
+    class InvalidSnapshot:
+        def __enter__(self):
+            return iter([DisappearedApprovalStore()])
+
+        def __exit__(self, *_args):
+            return False
+
+    def invalid_scandir(_path):
+        nonlocal scans
+        scans += 1
+        return InvalidSnapshot()
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(security_paths.os, "scandir", invalid_scandir)
+        with pytest.raises(
+            StateConfigurationError,
+            match="state object cannot be inspected safely",
+        ):
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+    assert scans == 1
+    assert not (state_root / "workspace-binding.json").exists()
+
+
+def test_known_existing_state_is_preserved_during_initial_binding(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    approval_path = state_root / "approvals.json"
+    original = b'{"version":2,"requests":{}}\n'
+    approval_path.write_bytes(original)
+
+    loaded = _load_state_root(
+        {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+        workspace.resolve(),
+    )
+
+    assert loaded == state_root.resolve()
+    assert approval_path.read_bytes() == original
+    assert sorted(path.name for path in state_root.iterdir()) == [
+        "approvals.json",
+        "workspace-binding.json",
+        "workspace-binding.json.lock",
+    ]
+
+
+def test_known_state_object_with_unsafe_type_is_rejected_without_mutation(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    approval_path = state_root / "approvals.json"
+    approval_path.mkdir()
+
+    with pytest.raises(StateConfigurationError, match="not a regular file"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    assert approval_path.is_dir()
+    assert sorted(path.name for path in state_root.iterdir()) == ["approvals.json"]
+
+
+def test_unexpected_existing_state_object_is_rejected_without_mutation(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    unexpected = state_root / "unrelated.txt"
+    unexpected.write_text("unchanged", encoding="utf-8")
+
+    with pytest.raises(StateConfigurationError, match="unexpected state object"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    assert unexpected.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in state_root.iterdir()) == ["unrelated.txt"]
+
+
+def test_state_root_symlink_is_rejected_without_touching_target(temp_dir):
+    workspace = temp_dir / "workspace"
+    target = temp_dir / "unrelated-target"
+    state_root = temp_dir / "state-link"
+    workspace.mkdir()
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    try:
+        os.symlink(target, state_root, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(StateConfigurationError, match="must not be a symlink"):
+        _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.absolute())},
+            workspace.resolve(),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in target.iterdir()) == ["sentinel.txt"]
+
+
+def test_directory_initialization_failure_rolls_back_created_chain(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    existing_parent = temp_dir / "existing-parent"
+    missing_parent = existing_parent / "missing-parent"
+    state_root = missing_parent / "state"
+    workspace.mkdir()
+    existing_parent.mkdir()
+    original_secure = security_paths.secure_trusted_directory
+    calls = 0
+
+    def fail_second_directory(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError(errno.EACCES, "simulated lifecycle failure")
+        original_secure(path)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "secure_trusted_directory",
+            fail_second_directory,
+        )
+        with pytest.raises(StateConfigurationError) as captured:
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert not missing_parent.exists()
+    assert list(existing_parent.iterdir()) == []
+
+
+def test_state_binding_failure_rolls_back_empty_created_chain(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    existing_parent = temp_dir / "existing-parent"
+    missing_parent = existing_parent / "missing-parent"
+    state_root = missing_parent / "state"
+    workspace.mkdir()
+    existing_parent.mkdir()
+
+    def fail_binding(_state_root, _workspace_root, **_kwargs):
+        raise OSError(errno.EIO, "simulated lifecycle binding failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "_bind_state_namespace",
+            fail_binding,
+        )
+        with pytest.raises(
+            StateConfigurationError,
+            match="state initialization failed",
+        ) as captured:
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert not missing_parent.exists()
+    assert list(existing_parent.iterdir()) == []
+
+
+def test_binding_initialization_failure_is_recoverable(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    original_publish = security_paths._publish_binding_manifest
+    attempts = 0
+
+    def fail_once(binding_path, serialized):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EIO, "simulated lifecycle publication failure")
+        original_publish(binding_path, serialized)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "_publish_binding_manifest",
+            fail_once,
+        )
+        with pytest.raises(
+            StateConfigurationError,
+            match="initialization failed",
+        ) as captured:
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+        assert isinstance(captured.value.__cause__, OSError)
+        assert captured.value.__cause__.errno == errno.EIO
+        assert not (state_root / "workspace-binding.json").exists()
+        assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+        recovered = _load_state_root(
+            {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+            workspace.resolve(),
+        )
+
+    assert recovered == state_root.resolve()
+    assert attempts == 2
+    assert (state_root / "workspace-binding.json").is_file()
+
+
+def test_state_directory_swap_is_rejected_without_modifying_target(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    target = temp_dir / "unrelated-target"
+    workspace.mkdir()
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    probe = temp_dir / "symlink-probe"
+    try:
+        os.symlink(target, probe, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    probe.unlink()
+    original_secure = security_paths.secure_trusted_directory
+
+    def swap_state_directory(path):
+        original_secure(path)
+        if Path(path) == state_root:
+            state_root.rmdir()
+            os.symlink(target, state_root, target_is_directory=True)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(
+            security_paths,
+            "secure_trusted_directory",
+            swap_state_directory,
+        )
+        with pytest.raises(StateConfigurationError) as captured:
+            _load_state_root(
+                {"TOOLHUB_STATE_ROOT": str(state_root.resolve())},
+                workspace.resolve(),
+            )
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in target.iterdir()) == ["sentinel.txt"]
+
+
+def test_state_lifecycle_path_does_not_change_process_umask():
+    lifecycle_source = "\n".join(
+        inspect.getsource(function)
+        for function in (
+            security_paths._ensure_directory_component,
+            security_paths._ensure_directory_chain,
+            security_paths._inspect_state_directory,
+            security_paths._inspect_existing_state_candidate,
+            security_paths._validate_planned_state_location,
+            security_paths._load_state_root,
+            security_paths._validate_supplied_configuration,
+        )
+    )
+
+    assert "os.umask" not in lifecycle_source
+
+
+def test_rejected_configuration_after_freeze_does_not_touch_other_state(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    other_workspace = temp_dir / "other-workspace"
+    other_state = temp_dir / "other-state"
+    workspace.mkdir()
+    state_root.mkdir()
+    other_workspace.mkdir()
+    other_state.mkdir()
+    unexpected = other_state / "unrelated.txt"
+    unexpected.write_text("unchanged", encoding="utf-8")
+    configured = RuntimeConfiguration(
+        state_root=state_root.resolve(),
+        workspace_root=workspace.resolve(),
+    )
+    rejected = RuntimeConfiguration(
+        state_root=other_state.resolve(),
+        workspace_root=other_workspace.resolve(),
+    )
+    _reset_runtime_configuration_for_tests()
+
+    assert initialize_runtime_configuration(configured) == configured
+    with pytest.raises(RuntimeConfigurationError, match="already frozen"):
+        initialize_runtime_configuration(rejected)
+
+    assert unexpected.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in other_state.iterdir()) == ["unrelated.txt"]
 
 
 @pytest.mark.parametrize(
@@ -1067,8 +1470,10 @@ def test_explicit_state_symlink_resolving_inside_workspace_fails(temp_dir, monke
     monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(alias.absolute()))
     _reset_runtime_configuration_for_tests()
 
-    with pytest.raises(RuntimeConfigurationError, match="must be outside"):
+    with pytest.raises(StateConfigurationError, match="must not be a symlink"):
         get_state_root()
+
+    assert list(nested_state.iterdir()) == []
 
 
 @pytest.mark.parametrize("value", ["", "relative/state"])
@@ -1239,8 +1644,9 @@ def test_invalid_workspace_configuration_fails_clearly(temp_dir, monkeypatch):
 
 
 def test_workspace_cannot_contain_trusted_toolhub_state(temp_dir, monkeypatch):
+    state_root = temp_dir / "state"
     monkeypatch.setenv("TOOLHUB_WORKSPACE_ROOT", str(temp_dir.resolve()))
-    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str((temp_dir / "state").resolve()))
+    monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(state_root.resolve()))
     _reset_runtime_configuration_for_tests()
 
     with pytest.raises(
@@ -1248,6 +1654,8 @@ def test_workspace_cannot_contain_trusted_toolhub_state(temp_dir, monkeypatch):
         match="TOOLHUB_STATE_ROOT must be outside",
     ):
         initialize_runtime_configuration()
+
+    assert not state_root.exists()
 
 
 def test_external_git_repository_integration_smoke_flow(git_repo, run_git, monkeypatch):

@@ -370,6 +370,7 @@ def test_audit_redacts_sensitive_args():
 
 
 def test_audit_failure_does_not_break_execution(isolated_approval_store):
+    get_state_root()
     blocker = isolated_approval_store.parent / "blocker"
     blocker.write_text("not a directory", encoding="utf-8")
 

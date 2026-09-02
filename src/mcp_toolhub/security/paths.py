@@ -39,6 +39,22 @@ _BINDING_READ_INTERVAL_SECONDS = 0.01
 _BINDING_LOCK_TIMEOUT_SECONDS = 5.0
 _BINDING_LOCK_RETRY_SECONDS = 0.05
 
+_STATE_REGULAR_FILENAMES = frozenset(
+    {
+        _BINDING_FILENAME,
+        f"{_BINDING_FILENAME}.lock",
+        "approvals.json",
+        "approvals.json.lock",
+        "audit.jsonl",
+        "audit.jsonl.lock",
+    }
+)
+_STATE_TEMPORARY_NAMES = (
+    (f".{_BINDING_FILENAME}-", ".tmp"),
+    (".approvals-", ".tmp"),
+    (".audit-", ".tmp"),
+)
+
 
 class RuntimeConfigurationError(ValueError):
     """The trusted process-level runtime configuration is invalid."""
@@ -366,7 +382,12 @@ def _publish_binding_manifest(binding_path: Path, serialized: bytes) -> None:
                 pass
 
 
-def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
+def _bind_state_namespace(
+    state_root: Path,
+    workspace_root: Path,
+    *,
+    inspect_state: bool = False,
+) -> None:
     """Exclusively bind one trusted state namespace to one workspace."""
     binding_path = state_root / _BINDING_FILENAME
     serialized = (
@@ -381,6 +402,8 @@ def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:
 
     try:
         with _binding_lock(binding_path):
+            if inspect_state:
+                _inspect_state_directory(state_root, workspace_root)
             try:
                 binding_path.lstat()
             except FileNotFoundError:
@@ -402,6 +425,7 @@ def _ensure_directory_component(
     name: str,
     *,
     secure_existing: bool,
+    created_directories: list[Path] | None = None,
 ) -> Path:
     """Create and secure one component, optionally tightening an existing one."""
     if not name or Path(name).name != name:
@@ -415,14 +439,17 @@ def _ensure_directory_component(
     except FileExistsError:
         created = False
 
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode):
+    if created and created_directories is not None:
+        created_directories.append(path)
+
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode):
         raise OSError(
             errno.ELOOP,
             "ToolHub state directory must not be a symlink",
             os.fspath(path),
         )
-    if not stat.S_ISDIR(info.st_mode):
+    if not stat.S_ISDIR(before.st_mode):
         raise NotADirectoryError(
             errno.ENOTDIR,
             "ToolHub state path is not a directory",
@@ -434,12 +461,34 @@ def _ensure_directory_component(
         # before chmod. The lstat above provides a clear cross-platform type
         # error but is not used as chmod authority.
         secure_trusted_directory(path)
+
+    after = path.lstat()
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISDIR(after.st_mode)
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+    ):
+        raise OSError(
+            errno.EAGAIN,
+            "ToolHub state directory changed during initialization",
+            os.fspath(path),
+        )
     return path
 
 
-def _secure_toolhub_directory(parent: Path, name: str) -> Path:
+def _secure_toolhub_directory(
+    parent: Path,
+    name: str,
+    *,
+    created_directories: list[Path] | None = None,
+) -> Path:
     """Create or validate one ToolHub-owned directory below ``parent``."""
-    return _ensure_directory_component(parent, name, secure_existing=True)
+    return _ensure_directory_component(
+        parent,
+        name,
+        secure_existing=True,
+        created_directories=created_directories,
+    )
 
 
 def _existing_external_state_parent(path: Path) -> Path:
@@ -461,7 +510,11 @@ def _existing_external_state_parent(path: Path) -> Path:
     return parent
 
 
-def _ensure_directory_chain(target: Path) -> Path:
+def _ensure_directory_chain(
+    target: Path,
+    *,
+    created_directories: list[Path] | None = None,
+) -> Path:
     """Securely create each missing component below the deepest existing parent."""
     missing_components: list[str] = []
     ancestor = target
@@ -488,8 +541,199 @@ def _ensure_directory_chain(target: Path) -> Path:
             current,
             name,
             secure_existing=False,
+            created_directories=created_directories,
         )
     return current
+
+
+def _is_state_temporary_name(name: str) -> bool:
+    return any(
+        name.startswith(prefix) and name.endswith(suffix) and len(name) > len(prefix)
+        for prefix, suffix in _STATE_TEMPORARY_NAMES
+    )
+
+
+def _inspect_state_directory(state_root: Path, workspace_root: Path) -> None:
+    """Validate an existing state namespace without adopting unknown objects."""
+    deadline = time.monotonic() + _BINDING_READ_TIMEOUT_SECONDS
+
+    while True:
+        try:
+            root_info = state_root.lstat()
+            if stat.S_ISLNK(root_info.st_mode):
+                raise OSError(
+                    errno.ELOOP,
+                    "trusted state root must not be a symlink",
+                    os.fspath(state_root),
+                )
+            if not stat.S_ISDIR(root_info.st_mode):
+                raise NotADirectoryError(
+                    errno.ENOTDIR,
+                    "trusted state root is not a directory",
+                    os.fspath(state_root),
+                )
+
+            with os.scandir(state_root) as iterator:
+                entries = {entry.name: entry for entry in iterator}
+        except (OSError, RuntimeError) as exc:
+            raise StateConfigurationError(
+                "Invalid TOOLHUB_STATE_ROOT: existing state cannot be inspected safely"
+            ) from exc
+
+        known_names = {
+            name
+            for name in entries
+            if name in _STATE_REGULAR_FILENAMES or _is_state_temporary_name(name)
+        }
+        transient_disappeared = False
+        for name in sorted(known_names):
+            entry = entries[name]
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError as exc:
+                if not _is_state_temporary_name(name):
+                    raise StateConfigurationError(
+                        "Invalid TOOLHUB_STATE_ROOT: state object cannot be "
+                        "inspected safely"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise StateConfigurationError(
+                        "Invalid TOOLHUB_STATE_ROOT: state changed repeatedly "
+                        "during inspection"
+                    ) from exc
+                transient_disappeared = True
+                break
+            except OSError as exc:
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object cannot be inspected safely"
+                ) from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object must not be a "
+                    f"symlink: {name}"
+                )
+            if not stat.S_ISREG(info.st_mode):
+                raise StateConfigurationError(
+                    "Invalid TOOLHUB_STATE_ROOT: state object is not a regular "
+                    f"file: {name}"
+                )
+
+        if transient_disappeared:
+            remaining = max(0.0, deadline - time.monotonic())
+            time.sleep(min(_BINDING_READ_INTERVAL_SECONDS, remaining))
+            continue
+
+        unexpected_names = sorted(set(entries) - known_names)
+        if unexpected_names:
+            raise StateConfigurationError(
+                "Invalid TOOLHUB_STATE_ROOT: unexpected state object: "
+                f"{unexpected_names[0]}"
+            )
+
+        if _BINDING_FILENAME not in entries:
+            return
+
+        _read_binding_manifest(state_root / _BINDING_FILENAME, workspace_root)
+        return
+
+
+def _inspect_existing_state_candidate(
+    state_directory: Path,
+    workspace_root: Path,
+) -> Path | None:
+    """Return a canonical safe existing state root, or ``None`` if absent."""
+    try:
+        info = state_directory.lstat()
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError) as exc:
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state path cannot be inspected safely"
+        ) from exc
+
+    if stat.S_ISLNK(info.st_mode):
+        error = OSError(
+            errno.ELOOP,
+            "trusted state root must not be a symlink",
+            os.fspath(state_directory),
+        )
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state path must not be a symlink"
+        ) from error
+    if not stat.S_ISDIR(info.st_mode):
+        error = NotADirectoryError(
+            errno.ENOTDIR,
+            "trusted state root is not a directory",
+            os.fspath(state_directory),
+        )
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state path is not a directory"
+        ) from error
+
+    try:
+        state_root = state_directory.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: existing state cannot be resolved safely"
+        ) from exc
+
+    if _state_is_inside_workspace(state_root, workspace_root):
+        raise StateConfigurationError(
+            "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
+            "TOOLHUB_WORKSPACE_ROOT"
+        )
+
+    _inspect_state_directory(state_root, workspace_root)
+    return state_root
+
+
+def _validate_planned_state_location(
+    candidate: Path,
+    workspace_root: Path,
+) -> None:
+    """Reject an unsafe state location before creating any directories."""
+    try:
+        info = candidate.lstat()
+    except FileNotFoundError:
+        pass
+    except (OSError, RuntimeError) as exc:
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state path cannot be inspected safely"
+        ) from exc
+    else:
+        if stat.S_ISLNK(info.st_mode):
+            error = OSError(
+                errno.ELOOP,
+                "trusted state root must not be a symlink",
+                os.fspath(candidate),
+            )
+            raise StateConfigurationError(
+                "Invalid TOOLHUB_STATE_ROOT: state path must not be a symlink"
+            ) from error
+
+    try:
+        planned_state_root = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state path cannot be resolved safely"
+        ) from exc
+
+    if _state_is_inside_workspace(planned_state_root, workspace_root):
+        raise StateConfigurationError(
+            "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
+            "TOOLHUB_WORKSPACE_ROOT"
+        )
+
+
+def _rollback_created_directories(created_directories: list[Path]) -> None:
+    """Best-effort rollback of empty directories owned by this attempt."""
+    for path in reversed(created_directories):
+        try:
+            path.rmdir()
+        except OSError:
+            # Never remove pre-existing state or files published by another
+            # initializer, and never replace the original failure.
+            pass
 
 
 def _load_state_root(
@@ -510,27 +754,34 @@ def _load_state_root(
                 "Invalid TOOLHUB_STATE_ROOT: path must be absolute"
             )
 
-    try:
-        unresolved_state_root = candidate.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise StateConfigurationError(
-            f"Invalid TOOLHUB_STATE_ROOT: path cannot be resolved: {candidate}"
-        ) from exc
+    _validate_planned_state_location(candidate, workspace_root)
 
-    if _state_is_inside_workspace(unresolved_state_root, workspace_root):
-        raise RuntimeConfigurationError(
-            "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
-            "TOOLHUB_WORKSPACE_ROOT"
-        )
-
+    created_directories: list[Path] = []
     try:
         if value is None:
-            external_parent = _ensure_directory_chain(base.parent)
-            toolhub_root = _secure_toolhub_directory(external_parent, base.name)
-            workspaces_root = _secure_toolhub_directory(toolhub_root, "workspaces")
+            external_parent = _ensure_directory_chain(
+                base.parent,
+                created_directories=created_directories,
+            )
+            toolhub_root = _secure_toolhub_directory(
+                external_parent,
+                base.name,
+                created_directories=created_directories,
+            )
+            workspaces_root = _secure_toolhub_directory(
+                toolhub_root,
+                "workspaces",
+                created_directories=created_directories,
+            )
+            state_name = _workspace_identifier(workspace_root)
+            _inspect_existing_state_candidate(
+                workspaces_root / state_name,
+                workspace_root,
+            )
             state_directory = _secure_toolhub_directory(
                 workspaces_root,
-                _workspace_identifier(workspace_root),
+                state_name,
+                created_directories=created_directories,
             )
         else:
             if not candidate.name:
@@ -538,26 +789,63 @@ def _load_state_root(
                     errno.EINVAL,
                     "TOOLHUB_STATE_ROOT must name a ToolHub-owned directory",
                 )
-            external_parent = _ensure_directory_chain(candidate.parent)
+            _inspect_existing_state_candidate(candidate, workspace_root)
+            external_parent = _ensure_directory_chain(
+                candidate.parent,
+                created_directories=created_directories,
+            )
             state_directory = _secure_toolhub_directory(
                 external_parent,
                 candidate.name,
+                created_directories=created_directories,
             )
 
+        state_info = state_directory.lstat()
+        if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
+            raise OSError(
+                errno.EAGAIN,
+                "trusted state root changed during initialization",
+                os.fspath(state_directory),
+            )
         state_root = state_directory.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
+        _rollback_created_directories(created_directories)
         raise StateConfigurationError(
             "Invalid TOOLHUB_STATE_ROOT: path cannot be created, resolved, or "
             "secured: "
             f"{candidate}"
         ) from exc
+    except StateConfigurationError:
+        _rollback_created_directories(created_directories)
+        raise
 
     if not state_root.is_dir():
+        _rollback_created_directories(created_directories)
         raise StateConfigurationError(
             f"Invalid TOOLHUB_STATE_ROOT: path is not a directory: {state_root}"
         )
 
-    _bind_state_namespace(state_root, workspace_root)
+    if _state_is_inside_workspace(state_root, workspace_root):
+        _rollback_created_directories(created_directories)
+        raise StateConfigurationError(
+            "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
+            "TOOLHUB_WORKSPACE_ROOT"
+        )
+
+    try:
+        # Reinspect after all directory operations. This closes the lifecycle
+        # gap between initial discovery and binding and rejects objects that
+        # appeared during initialization.
+        _inspect_state_directory(state_root, workspace_root)
+        _bind_state_namespace(state_root, workspace_root, inspect_state=True)
+    except StateConfigurationError:
+        _rollback_created_directories(created_directories)
+        raise
+    except (OSError, RuntimeError) as exc:
+        _rollback_created_directories(created_directories)
+        raise StateConfigurationError(
+            "Invalid TOOLHUB_STATE_ROOT: state initialization failed"
+        ) from exc
 
     return state_root
 
@@ -583,34 +871,51 @@ def _load_runtime_configuration() -> RuntimeConfiguration:
 def _validate_supplied_configuration(configuration: RuntimeConfiguration) -> None:
     try:
         workspace_root = configuration.workspace_root.resolve(strict=True)
-        state_root = configuration.state_root.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise RuntimeConfigurationError(
-            "Supplied runtime configuration contains an unavailable root"
+            "Supplied runtime configuration contains an unavailable workspace root"
         ) from exc
 
-    if not workspace_root.is_dir() or not state_root.is_dir():
+    if not workspace_root.is_dir():
         raise RuntimeConfigurationError(
-            "Supplied runtime configuration roots must be directories"
+            "Supplied runtime configuration workspace root must be a directory"
         )
-    if (
-        workspace_root != configuration.workspace_root
-        or state_root != configuration.state_root
-    ):
+    if workspace_root != configuration.workspace_root:
         raise RuntimeConfigurationError(
-            "Supplied runtime configuration roots must be canonical"
+            "Supplied runtime configuration workspace root must be canonical"
+        )
+
+    state_root = _inspect_existing_state_candidate(
+        configuration.state_root,
+        workspace_root,
+    )
+    if state_root is None:
+        error = FileNotFoundError(
+            errno.ENOENT,
+            "supplied trusted state root does not exist",
+            os.fspath(configuration.state_root),
+        )
+        raise StateConfigurationError(
+            "Supplied runtime configuration contains an unavailable state root"
+        ) from error
+    if state_root != configuration.state_root:
+        raise StateConfigurationError(
+            "Supplied runtime configuration state root must be canonical"
         )
     if _state_is_inside_workspace(state_root, workspace_root):
-        raise RuntimeConfigurationError(
+        raise StateConfigurationError(
             "Invalid runtime configuration: TOOLHUB_STATE_ROOT must be outside "
             "TOOLHUB_WORKSPACE_ROOT"
         )
     try:
         secure_trusted_directory(state_root)
     except (OSError, RuntimeError) as exc:
-        raise RuntimeConfigurationError(
+        raise StateConfigurationError(
             "Supplied runtime configuration state root could not be secured"
         ) from exc
+
+    _inspect_state_directory(state_root, workspace_root)
+    _bind_state_namespace(state_root, workspace_root, inspect_state=True)
 
 
 def initialize_runtime_configuration(
@@ -625,20 +930,20 @@ def initialize_runtime_configuration(
 
     global _configuration
 
-    if configuration is not None:
-        _validate_supplied_configuration(configuration)
+    with _configuration_lock:
+        if _configuration is not None:
+            if configuration is not None and configuration != _configuration:
+                raise RuntimeConfigurationError(
+                    "Runtime configuration is already frozen for this process"
+                )
+            return _configuration
 
-    if _configuration is None:
-        with _configuration_lock:
-            if _configuration is None:
-                _configuration = configuration or _load_runtime_configuration()
-
-    if configuration is not None and configuration != _configuration:
-        raise RuntimeConfigurationError(
-            "Runtime configuration is already frozen for this process"
-        )
-
-    return _configuration
+        if configuration is not None:
+            _validate_supplied_configuration(configuration)
+            _configuration = configuration
+        else:
+            _configuration = _load_runtime_configuration()
+        return _configuration
 
 
 def get_workspace_root() -> Path:
