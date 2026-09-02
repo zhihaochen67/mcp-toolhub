@@ -18,8 +18,10 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from platformdirs import user_state_path
 
 from mcp_toolhub.security.state_permissions import (
+    TRUSTED_FILE_MODE,
     open_trusted_file,
     secure_trusted_directory,
+    secure_trusted_file_descriptor,
 )
 
 if os.name == "nt":
@@ -293,16 +295,41 @@ def _binding_lock(
             pass
 
 
+def _create_binding_temporary_file(temporary_path: Path) -> int:
+    """Exclusively create and secure one owned binding temporary file."""
+    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary_path, open_flags, TRUSTED_FILE_MODE)
+
+    try:
+        # O_CREAT | O_EXCL makes creation fail for an existing final component,
+        # including a symlink, without duplicating the trusted open helper's
+        # O_NOFOLLOW compatibility logic.
+        secure_trusted_file_descriptor(descriptor)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    return descriptor
+
+
 def _publish_binding_manifest(binding_path: Path, serialized: bytes) -> None:
     """Atomically publish a complete manifest without replacing any binding."""
     temporary_path = binding_path.with_name(
         f".{binding_path.name}-{secrets.token_hex(8)}.tmp"
     )
-    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
     descriptor: int | None = None
+    temporary_owned = False
 
     try:
-        descriptor = open_trusted_file(temporary_path, open_flags)
+        descriptor = _create_binding_temporary_file(temporary_path)
+        temporary_owned = True
         written = 0
         while written < len(serialized):
             count = os.write(descriptor, serialized[written:])
@@ -325,16 +352,18 @@ def _publish_binding_manifest(binding_path: Path, serialized: bytes) -> None:
                 os.close(descriptor)
             except OSError:
                 pass
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if temporary_owned:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
     else:
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if temporary_owned:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _bind_state_namespace(state_root: Path, workspace_root: Path) -> None:

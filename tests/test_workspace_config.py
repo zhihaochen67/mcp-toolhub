@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import difflib
 import errno
+import inspect
 import json
 import multiprocessing
 import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -737,6 +739,180 @@ def test_binding_lock_non_contention_error_is_not_retried(temp_dir, monkeypatch)
     assert (state_root / "workspace-binding.json.lock").is_file()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_binding_temporary_file_is_private_before_publication(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    original_link = security_paths.os.link
+    observed_modes = []
+
+    def inspect_publication(source, destination):
+        observed_modes.append(stat.S_IMODE(Path(source).stat().st_mode))
+        return original_link(source, destination)
+
+    monkeypatch.setattr(security_paths.os, "link", inspect_publication)
+
+    security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert observed_modes == [0o600]
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_published_binding_manifest_is_private(temp_dir):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+
+    security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    binding_path = state_root / "workspace-binding.json"
+    assert stat.S_IMODE(binding_path.stat().st_mode) == 0o600
+
+
+def test_binding_temporary_file_collision_is_not_removed(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    monkeypatch.setattr(security_paths.secrets, "token_hex", lambda _size: "fixed")
+    temporary_path = state_root / ".workspace-binding.json-fixed.tmp"
+    original = b"unowned temporary file\n"
+    temporary_path.write_bytes(original)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, FileExistsError)
+    assert temporary_path.read_bytes() == original
+    assert not (state_root / "workspace-binding.json").exists()
+
+
+def test_binding_permission_normalization_failure_cleans_owned_temporary_file(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+
+    def fail_permissions(_descriptor):
+        raise PermissionError(errno.EACCES, "simulated permission failure")
+
+    monkeypatch.setattr(
+        security_paths,
+        "secure_trusted_file_descriptor",
+        fail_permissions,
+    )
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, PermissionError)
+    assert not (state_root / "workspace-binding.json").exists()
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_binding_short_writes_are_completed_before_publication(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    original_write = security_paths.os.write
+    write_sizes = []
+
+    def short_write(descriptor, data):
+        chunk = data[:7]
+        write_sizes.append(len(chunk))
+        return original_write(descriptor, chunk)
+
+    monkeypatch.setattr(security_paths.os, "write", short_write)
+
+    security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    binding_path = state_root / "workspace-binding.json"
+    assert len(write_sizes) > 1
+    assert json.loads(binding_path.read_text(encoding="utf-8")) == {
+        "canonical_workspace": str(workspace.resolve()),
+        "schema_version": 1,
+    }
+
+
+def test_binding_write_failure_preserves_binding_that_appears(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    winner = temp_dir / "winner"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    winner.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    winner_payload = (
+        json.dumps(
+            {
+                "canonical_workspace": str(winner.resolve()),
+                "schema_version": 1,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    def fail_write(_descriptor, _serialized):
+        binding_path.write_bytes(winner_payload)
+        raise OSError(errno.EIO, "simulated write failure")
+
+    monkeypatch.setattr(security_paths.os, "write", fail_write)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert binding_path.read_bytes() == winner_payload
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_binding_fsync_failure_prevents_publication(temp_dir, monkeypatch):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+
+    def fail_fsync(_descriptor):
+        raise OSError(errno.EIO, "simulated fsync failure")
+
+    monkeypatch.setattr(security_paths.os, "fsync", fail_fsync)
+
+    with pytest.raises(
+        StateConfigurationError, match="initialization failed"
+    ) as captured:
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert captured.value.__cause__.errno == errno.EIO
+    assert not (state_root / "workspace-binding.json").exists()
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
 def test_binding_publication_never_overwrites_manifest_that_appears(
     temp_dir,
     monkeypatch,
@@ -766,6 +942,39 @@ def test_binding_publication_never_overwrites_manifest_that_appears(
     assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
 
 
+def test_binding_publication_rejects_final_symlink_race_without_touching_target(
+    temp_dir,
+    monkeypatch,
+):
+    workspace = temp_dir / "workspace"
+    state_root = temp_dir / "state"
+    workspace.mkdir()
+    state_root.mkdir()
+    binding_path = state_root / "workspace-binding.json"
+    target = state_root / "unrelated-target.json"
+    original = b"unrelated content\n"
+    target.write_bytes(original)
+    probe = state_root / "symlink-probe"
+    try:
+        os.symlink(target, probe)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+    probe.unlink()
+
+    def concurrent_symlink(_source, destination):
+        os.symlink(target, destination)
+        raise FileExistsError(errno.EEXIST, "binding symlink appeared")
+
+    monkeypatch.setattr(security_paths.os, "link", concurrent_symlink)
+
+    with pytest.raises(StateConfigurationError, match="must not be a symlink"):
+        security_paths._bind_state_namespace(state_root, workspace.resolve())
+
+    assert binding_path.is_symlink()
+    assert target.read_bytes() == original
+    assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
 def test_failed_binding_publication_cleans_temporary_file(temp_dir, monkeypatch):
     workspace = temp_dir / "workspace"
     state_root = temp_dir / "state"
@@ -786,6 +995,19 @@ def test_failed_binding_publication_cleans_temporary_file(temp_dir, monkeypatch)
     assert captured.value.__cause__.errno == errno.EIO
     assert not (state_root / "workspace-binding.json").exists()
     assert not list(state_root.glob(".workspace-binding.json-*.tmp"))
+
+
+def test_binding_write_path_does_not_change_process_umask():
+    write_path_source = "\n".join(
+        inspect.getsource(function)
+        for function in (
+            security_paths._create_binding_temporary_file,
+            security_paths._publish_binding_manifest,
+            security_paths._bind_state_namespace,
+        )
+    )
+
+    assert "os.umask" not in write_path_source
 
 
 def test_existing_binding_symlink_fails_closed(temp_dir):
