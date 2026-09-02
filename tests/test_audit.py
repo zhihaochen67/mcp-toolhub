@@ -389,6 +389,144 @@ def test_audit_failure_does_not_break_execution(isolated_approval_store):
     assert result.returncode == 0
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_new_audit_log_is_created_with_private_permissions(temp_dir):
+    audit_path = temp_dir / "audit.jsonl"
+
+    assert audit.record_event(tool="test", action="create", audit_path=audit_path)
+
+    assert stat.S_IMODE(audit_path.stat().st_mode) == 0o600
+
+
+def test_existing_audit_log_append_preserves_order_and_jsonl(temp_dir):
+    audit_path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0]
+    audit_path.write_bytes(original)
+
+    assert audit.record_event(
+        tool="test",
+        action="append",
+        trace_id="trc_appended",
+        timestamp="2026-09-02T00:00:00+00:00",
+        audit_path=audit_path,
+    )
+
+    lines = audit_path.read_bytes().splitlines(keepends=True)
+    assert lines[0] == original
+    assert all(line.endswith(b"\n") for line in lines)
+    assert [json.loads(line)["trace_id"] for line in lines] == [
+        "trc_0",
+        "trc_appended",
+    ]
+
+
+def test_audit_append_permission_failure_returns_false_unchanged(
+    temp_dir,
+    monkeypatch,
+):
+    audit_path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0]
+    audit_path.write_bytes(original)
+    trusted_open = audit.open_trusted_file
+
+    def fail_audit_open(path, flags, mode=0o600):
+        if Path(path) == audit_path:
+            raise PermissionError("simulated audit permission failure")
+        return trusted_open(path, flags, mode)
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit, "open_trusted_file", fail_audit_open)
+        result = audit.record_event(
+            tool="test",
+            action="permission_failure",
+            audit_path=audit_path,
+        )
+
+    assert result is False
+    assert audit_path.read_bytes() == original
+
+
+def test_partial_audit_write_failure_rolls_back_existing_log(
+    temp_dir,
+    monkeypatch,
+):
+    audit_path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0]
+    audit_path.write_bytes(original)
+    original_write = audit.os.write
+    calls = 0
+
+    def write_part_then_fail(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, data[:8])
+        raise OSError("simulated audit write failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit.os, "write", write_part_then_fail)
+        result = audit.record_event(
+            tool="test",
+            action="write_failure",
+            audit_path=audit_path,
+        )
+
+    assert calls == 2
+    assert result is False
+    assert audit_path.read_bytes() == original
+
+
+def test_audit_fsync_failure_rolls_back_existing_log(temp_dir, monkeypatch):
+    audit_path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0]
+    audit_path.write_bytes(original)
+
+    def fail_fsync(_descriptor):
+        raise OSError("simulated audit fsync failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(audit.os, "fsync", fail_fsync)
+        result = audit.record_event(
+            tool="test",
+            action="fsync_failure",
+            audit_path=audit_path,
+        )
+
+    assert result is False
+    assert audit_path.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_audit_append_rejects_final_symlink_without_modifying_target(temp_dir):
+    target = temp_dir / "target.jsonl"
+    audit_path = temp_dir / "audit.jsonl"
+    original = _raw_audit_lines(0)[0]
+    target.write_bytes(original)
+    os.chmod(target, 0o644)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        os.symlink(target, audit_path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    result = audit.record_event(
+        tool="test",
+        action="symlink_failure",
+        audit_path=audit_path,
+    )
+
+    assert result is False
+    assert audit_path.is_symlink()
+    assert target.read_bytes() == original
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+
+
+def test_audit_write_path_does_not_change_process_umask():
+    source = Path(audit.__file__).read_text(encoding="utf-8")
+
+    assert "os.umask(" not in source
+
+
 def test_trace_ids_unique_and_unpredictable():
     ids = {audit.new_trace_id() for _ in range(50)}
     assert len(ids) == 50

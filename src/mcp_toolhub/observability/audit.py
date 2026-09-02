@@ -277,6 +277,52 @@ def _enum_value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
 
+def _open_audit_for_append(path: Path) -> int:
+    """Open an existing log or securely create it without following a symlink."""
+    open_flags = os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    try:
+        return open_trusted_file(path, open_flags)
+    except FileNotFoundError:
+        try:
+            return open_trusted_file(path, open_flags | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            # The final name appeared between the existing-file and exclusive
+            # creation attempts. Revalidate it through the trusted primitive.
+            return open_trusted_file(path, open_flags)
+
+
+def _append_audit_line(path: Path, encoded_line: bytes) -> None:
+    """Durably append one complete line, rolling back a failed partial append."""
+    descriptor: int | None = None
+    original_size: int | None = None
+
+    try:
+        descriptor = _open_audit_for_append(path)
+        original_size = os.fstat(descriptor).st_size
+
+        written = 0
+        while written < len(encoded_line):
+            count = os.write(descriptor, encoded_line[written:])
+            if count <= 0:
+                raise OSError(errno.EIO, "audit append made no progress")
+            written += count
+        os.fsync(descriptor)
+    except BaseException:
+        if descriptor is not None and original_size is not None:
+            try:
+                os.ftruncate(descriptor, original_size)
+                os.fsync(descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def record_event(
     *,
     tool: str,
@@ -345,16 +391,12 @@ def record_event(
         path = audit_path or _default_audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        line = (
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
 
         with _audit_write_lock(path):
-            open_flags = (
-                os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-            )
-            descriptor = open_trusted_file(path, open_flags)
-            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.flush()
+            _append_audit_line(path, line)
 
         return True
 
