@@ -953,13 +953,17 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
         previous_hash = _sha256_file(target) if target.exists() else None
         created = not target.exists()
 
+        # Match _atomic_write_text's UTF-8 encoding with no newline translation.
+        # Result metadata describes our publication, even if the target changes
+        # or becomes unreadable immediately after replacement.
+        prepared_bytes = content.encode("utf-8")
+        bytes_written = len(prepared_bytes)
+        new_hash = _sha256_bytes(prepared_bytes)
+
         if create_parents:
             target.parent.mkdir(parents=True, exist_ok=True)
 
         _atomic_write_text(target, content)
-
-        new_hash = _sha256_file(target)
-        bytes_written = len(content.encode("utf-8"))
 
     except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
@@ -1257,27 +1261,28 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
 
         target = _validate_patch_input(path, patch, expected_hash, root)
 
-        original_text = _decode_utf8_text(
-            path,
-            _read_bounded_file_bytes(path, target),
-        )
+        original_bytes = _read_bounded_file_bytes(path, target)
+        original_text = _decode_utf8_text(path, original_bytes)
 
         new_text, additions, deletions = apply_patch_text(original_text, patch, path)
 
-        bytes_before = len(original_text.encode("utf-8"))
-        bytes_after = len(new_text.encode("utf-8"))
+        prepared_bytes = new_text.encode("utf-8")
         maximum_write = min(MAX_WRITE_BYTES, MAX_FILE_SIZE)
-        if bytes_after > maximum_write:
+        if len(prepared_bytes) > maximum_write:
             raise ValueError(
                 f"Patched content is too large (maximum {maximum_write} bytes)"
             )
-        previous_hash = _sha256_file(target)
+        previous_hash = _sha256_bytes(original_bytes)
         changed = new_text != original_text
+
+        # Changed output matches _atomic_write_text's exact UTF-8 bytes. A no-op
+        # keeps the original bytes, including CRLF normalized only for patching.
+        bytes_before = len(original_bytes)
+        bytes_after = len(prepared_bytes) if changed else bytes_before
+        new_hash = _sha256_bytes(prepared_bytes) if changed else previous_hash
 
         if changed:
             _atomic_write_text(target, new_text)
-
-        new_hash = _sha256_file(target)
 
     except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         audit.record_event(
