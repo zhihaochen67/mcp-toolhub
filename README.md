@@ -302,6 +302,37 @@ or Contract V1 surface.
 
 ## Security model and limitations
 
+### Read-only Git helper policy
+
+`git.status` and `git.diff` inspect effective Git configuration (including
+includes and any global/system configuration visible to the sanitized child)
+and ask Git to resolve the `filter` attribute for tracked paths. An applicable
+executable clean or process driver causes a bounded refusal before the helper
+can run. An unrelated configured driver does not by itself prevent inspection.
+Git resolves nested attributes, attribute macros, `info/attributes`, global
+attributes, and index fallback; ToolHub does not implement its own matcher.
+
+Status checks all tracked paths; path-filtered diffs use Git's own pathspec
+selection. Staged diffs compare stored objects without requiring worktree
+filters. Final fail-closed guards also cover any additional paths Git might
+need to filter. Gitlinks in either the index or HEAD cause a refusal:
+ToolHub does not recursively validate submodule configuration or hide submodule
+changes. Missing objects cannot trigger transport helpers. Existing pager,
+fsmonitor, external-diff, textconv, environment, output, timeout, and process
+containment protections remain in force.
+
+Inspection has a shared 20-second preflight budget and bounded captured output,
+at most 256 matching configuration entries, and at most 4,096 entries in each
+index/tree scan. Attribute argument batches and final filter guard options are
+also bounded. Truncated, malformed, ambiguous, or unrepresentable safety metadata
+causes refusal rather than a partial result.
+
+This is a preflight policy for a cooperating workspace, not an atomic snapshot
+against a local adversary replacing configuration, attributes, or the index
+between subprocesses. Known executable drivers are also guarded in the final
+command: if a newly changed attribute selects one, filtering must fail rather
+than execute its helper or silently compare unfiltered content.
+
 ### Structured shell commands
 
 `shell.run` uses a deny-by-default command policy. LOW is limited to exact

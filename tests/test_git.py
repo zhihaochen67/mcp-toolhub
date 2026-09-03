@@ -252,12 +252,15 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
     def fake_run(executable, args, **kwargs):
         command = [executable, *args]
         calls.append((command, kwargs))
-        if "rev-parse" in command:
+        returncode = 0
+        if "--show-toplevel" in command:
             stdout = f"{git_repo}\n"
         else:
             stdout = ""
+            if "config" in command or "--verify" in command:
+                returncode = 1  # No filters and an unborn HEAD.
         return ContainedProcessResult(
-            0,
+            returncode,
             stdout,
             "",
             False,
@@ -279,17 +282,17 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
     git_executable = str(Path(shutil.which("git")).resolve())
     rev_parse_cmd = [git_executable, *global_args, "rev-parse", "--show-toplevel"]
 
-    assert len(calls) == 4
+    assert len(calls) == 10
     assert calls[0][0] == rev_parse_cmd
-    assert calls[1][0] == [
+    assert calls[4][0] == [
         git_executable,
         *global_args,
         "status",
         "--porcelain=v1",
         "--branch",
     ]
-    assert calls[2][0] == rev_parse_cmd
-    assert calls[3][0] == [
+    assert calls[5][0] == rev_parse_cmd
+    assert calls[9][0] == [
         git_executable,
         *global_args,
         "diff",
@@ -297,12 +300,41 @@ def test_git_tools_use_hardened_invocation(monkeypatch, git_repo):
         "--no-textconv",
     ]
 
-    for _, kwargs in calls:
+    for offset in (0, 5):
+        assert calls[offset + 1][0] == [
+            git_executable,
+            *global_args,
+            "config",
+            "--includes",
+            "--null",
+            "--get-regexp",
+            git_tools._FILTER_CONFIG_PATTERN,
+        ]
+        assert calls[offset + 2][0] == [
+            git_executable,
+            *global_args,
+            "ls-files",
+            "--stage",
+            "-z",
+        ]
+        assert calls[offset + 3][0] == [
+            git_executable,
+            *global_args,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD",
+        ]
+
+    for command, kwargs in calls:
+        assert command[1:5] == global_args
         assert kwargs["cwd"] == git_repo
-        assert kwargs["timeout_seconds"] == GIT_TIMEOUT_SECONDS
+        assert 0 < kwargs["timeout_seconds"] <= GIT_TIMEOUT_SECONDS
 
         env = kwargs["env"]
         assert env["GIT_OPTIONAL_LOCKS"] == "0"
+        assert env["GIT_NO_LAZY_FETCH"] == "1"
+        assert env["GIT_ALLOW_PROTOCOL"] == ""
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         assert env["GIT_PAGER"] == "cat"
         assert "PATH" not in env
@@ -350,6 +382,22 @@ def test_git_status_does_not_execute_repo_fsmonitor(git_repo):
     # A repository with core.fsmonitor enabled makes plain `git status`
     # spawn the fsmonitor daemon process, which leaves a marker directory
     # inside .git. The hardened tool must never do that.
+    capability = subprocess.run(
+        ["git", "fsmonitor--daemon", "status"],
+        cwd=git_repo,
+        env={**os.environ, "LC_ALL": "C"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    diagnostic = capability.stderr.lower()
+    if "not supported on this platform" in diagnostic or (
+        "fsmonitor--daemon" in diagnostic and "not a git command" in diagnostic
+    ):
+        # The separate hook-path regression still runs on these installations.
+        pytest.skip("installed Git lacks built-in fsmonitor daemon support")
+
     _write(git_repo, "a.txt", "hello")
     _git(git_repo, "add", "a.txt")
     _git(git_repo, "config", "core.fsmonitor", "true")
