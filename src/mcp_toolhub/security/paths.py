@@ -93,6 +93,47 @@ def is_portably_rooted_path(path: str) -> bool:
     )
 
 
+def has_portable_parent_reference(path: str) -> bool:
+    """Return whether ``path`` contains an explicit ``..`` component.
+
+    Check both POSIX and Windows syntax regardless of the host. MCP path
+    values are portable API inputs; accepting a backslash traversal on POSIX
+    and later interpreting the same stored value on Windows would make the
+    boundary platform-dependent.
+    """
+
+    return ".." in PurePosixPath(path).parts or ".." in PureWindowsPath(path).parts
+
+
+def _validate_workspace_path_input(path: str) -> None:
+    """Reject malformed, rooted, or traversal-bearing workspace API paths."""
+
+    if not isinstance(path, str):
+        raise TypeError("Workspace path must be a string")
+    if "\0" in path:
+        raise ValueError("Access denied: workspace path is malformed")
+    if is_portably_rooted_path(path) or has_portable_parent_reference(path):
+        raise ValueError("Access denied: path escapes workspace")
+
+    if os.name == "nt":
+        # Relative Win32 device names and alternate data streams do not obey
+        # ordinary file containment semantics. Reject them before Path opens
+        # anything. Rooted/drive syntax was handled above.
+        reserved_names = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        for part in PureWindowsPath(path).parts:
+            normalized = part.rstrip(" .")
+            stem = normalized.split(".", 1)[0].upper()
+            if ":" in part or stem in reserved_names:
+                raise ValueError("Access denied: workspace path is unsafe")
+
+
 _configuration_lock = threading.Lock()
 
 
@@ -973,16 +1014,18 @@ def resolve_path_within(path: str, root: Path | None = None) -> Path:
     process-level ToolHub workspace.
     """
 
-    if is_portably_rooted_path(path):
-        raise ValueError(f"Access denied: path escapes workspace: {path}")
+    _validate_workspace_path_input(path)
 
-    effective_root = (root or get_workspace_root()).resolve()
-    target = (effective_root / path).resolve()
+    try:
+        effective_root = (root or get_workspace_root()).resolve()
+        target = (effective_root / path).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Workspace path could not be resolved safely") from exc
 
     try:
         target.relative_to(effective_root)
     except ValueError as exc:
-        raise ValueError(f"Access denied: path escapes workspace: {path}") from exc
+        raise ValueError("Access denied: path escapes workspace") from exc
 
     return target
 
