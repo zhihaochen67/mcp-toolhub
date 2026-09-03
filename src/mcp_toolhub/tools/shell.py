@@ -41,6 +41,10 @@ from mcp_toolhub.security.risk import RiskLevel
 
 MAX_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 20_000
+MAX_PROGRAM_CHARS = 4_096
+MAX_ARGUMENTS = 256
+MAX_ARGUMENT_CHARS = 32_768
+MAX_TOTAL_ARGUMENT_CHARS = 131_072
 
 
 class ShellRunResult(ContractLifecycle):
@@ -113,6 +117,40 @@ def _format_captured_output(
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _validate_command_input(
+    program: str,
+    args: list[str] | None,
+    timeout_seconds: int,
+) -> tuple[list[str], int]:
+    """Validate and bound command material before policy or persistence."""
+
+    if not isinstance(program, str) or not program or "\0" in program:
+        raise ValueError("Command program is empty or malformed.")
+    if len(program) > MAX_PROGRAM_CHARS:
+        raise ValueError("Command program exceeds the maximum length.")
+    if args is not None and not isinstance(args, list):
+        raise TypeError("Command arguments must be a list of strings.")
+
+    command_args = list(args or [])
+    if len(command_args) > MAX_ARGUMENTS:
+        raise ValueError("Command contains too many arguments.")
+
+    total_chars = 0
+    for argument in command_args:
+        if not isinstance(argument, str) or "\0" in argument:
+            raise ValueError("Command contains a malformed argument.")
+        if len(argument) > MAX_ARGUMENT_CHARS:
+            raise ValueError("Command argument exceeds the maximum length.")
+        total_chars += len(argument)
+        if total_chars > MAX_TOTAL_ARGUMENT_CHARS:
+            raise ValueError("Command arguments exceed the total size limit.")
+
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool):
+        raise TypeError("Command timeout must be an integer.")
+
+    return command_args, max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
 
 
 def _execute_subprocess(
@@ -433,11 +471,57 @@ def run_shell(
 
     trace_id = audit.new_trace_id()
     started = time.monotonic()
-    command_args = list(args or [])
+
+    try:
+        command_args, timeout_seconds = _validate_command_input(
+            program,
+            args,
+            timeout_seconds,
+        )
+    except (TypeError, ValueError) as exc:
+        reason = "Command input validation failed before execution."
+        audit.record_event(
+            trace_id=trace_id,
+            tool="shell.run",
+            action="failure",
+            risk=RiskLevel.HIGH,
+            executed=False,
+            success=False,
+            duration_ms=_elapsed_ms(started),
+            arguments={
+                "program_chars": len(program) if isinstance(program, str) else None,
+                "argument_count": len(args) if isinstance(args, list) else None,
+            },
+            error=str(exc),
+            error_type=type(exc).__name__,
+            extra={
+                "command_policy": {
+                    "decision": "refused",
+                    "risk": RiskLevel.HIGH.value,
+                    "reason": reason,
+                }
+            },
+        )
+        return ShellRunResult(
+            outcome=ContractOutcome.REFUSED,
+            trace_id=trace_id,
+            error=make_contract_error("COMMAND_INPUT_INVALID", str(exc)),
+            program=(
+                program
+                if isinstance(program, str) and len(program) <= MAX_PROGRAM_CHARS
+                else ""
+            ),
+            args=[],
+            cwd=cwd if isinstance(cwd, str) else ".",
+            risk=RiskLevel.HIGH,
+            risk_reason=reason,
+            executed=False,
+            message=str(exc),
+        )
 
     try:
         working_directory = _resolve_working_directory(cwd)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
         audit.record_event(
             trace_id=trace_id,
             tool="shell.run",
@@ -487,7 +571,6 @@ def run_shell(
         workspace_root=get_workspace_root(),
     )
     policy_metadata = assessment.audit_metadata()
-    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT_SECONDS))
     relative_cwd = relative_workspace_path(working_directory)
 
     if assessment.level == RiskLevel.LOW:
@@ -804,6 +887,32 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
         policy_metadata = stored_policy
 
     try:
+        consumed_args, timeout_seconds = _validate_command_input(
+            consumed.program,
+            consumed.args,
+            consumed.timeout_seconds,
+        )
+    except (TypeError, ValueError) as exc:
+        message = "Approved command input is malformed or exceeds a resource limit."
+        audit_rejection(
+            status=consumed.status,
+            error=message,
+            error_type=type(exc).__name__,
+            risk=consumed.risk,
+        )
+        return _rejected_result(
+            request_id,
+            trace_id=trace_id,
+            risk=consumed.risk,
+            risk_reason=consumed.risk_reason,
+            status=consumed.status,
+            message=message,
+            approval_handle=consumed.public_handle(),
+            outcome=ContractOutcome.REFUSED,
+            error_code="COMMAND_INPUT_INVALID",
+        )
+
+    try:
         validate_workspace_snapshot(consumed.payload, get_workspace_root())
     except (TypeError, ValueError) as exc:
         message = f"Approval workspace identity is invalid: {exc}"
@@ -917,8 +1026,6 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
             error_code="WORKING_DIRECTORY_INVALID",
         )
 
-    timeout_seconds = max(1, min(consumed.timeout_seconds, MAX_TIMEOUT_SECONDS))
-
     try:
         execution_program = validate_executable_snapshot(
             consumed.payload.get("executable_snapshot")
@@ -951,7 +1058,7 @@ def run_approved_shell(request_id: str) -> ShellRunResult:
 
     return _execute_subprocess(
         consumed.program,
-        consumed.args,
+        consumed_args,
         working_directory,
         timeout_seconds,
         consumed.risk,

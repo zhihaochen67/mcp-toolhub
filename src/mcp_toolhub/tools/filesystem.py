@@ -61,6 +61,7 @@ from mcp_toolhub.security.risk import RiskLevel
 
 MAX_WRITE_BYTES = 256 * 1024  # 256 KB of UTF-8 text
 MAX_PATCH_CHARS = 256 * 1024
+MAX_DIRECTORY_ENTRIES = 2_048
 
 WRITE_RISK_REASON = "File mutation (write) requires approval."
 PATCH_RISK_REASON = "File mutation (patch) requires approval."
@@ -141,7 +142,15 @@ def _sha256_bytes(data: bytes) -> str:
 
 
 def _sha256_file(path: Path) -> str:
-    return _sha256_bytes(path.read_bytes())
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            total += len(chunk)
+            if total > MAX_FILE_SIZE:
+                raise ValueError(f"File too large (maximum {MAX_FILE_SIZE} bytes)")
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _effective_root(root: Path | None) -> Path:
@@ -172,8 +181,8 @@ def _ensure_no_symlink_components(root: Path, path: str) -> None:
         try:
             if current.is_symlink():
                 raise ValueError(f"Symlinks are not allowed: {path}")
-        except OSError:
-            pass
+        except OSError as exc:
+            raise ValueError("Workspace path could not be inspected safely") from exc
 
 
 def _resolve_mutation_target(root: Path, path: str) -> Path:
@@ -184,6 +193,8 @@ def _resolve_mutation_target(root: Path, path: str) -> Path:
 
     if target.exists() and target.is_dir():
         raise ValueError(f"Path is a directory, not a file: {path}")
+    if target.exists() and not target.is_file():
+        raise ValueError("Mutation target must be a regular file")
 
     return target
 
@@ -198,13 +209,52 @@ def _check_expected_hash(path: str, target: Path, expected_hash: str | None) -> 
             f"Conflict: {path} does not exist (expected sha256 {expected_hash})"
         )
 
-    actual = _sha256_file(target)
+    try:
+        actual = _sha256_file(target)
+    except OSError as exc:
+        raise MutationConflictError(
+            f"Conflict: {path} could not be read for hash validation"
+        ) from exc
 
     if actual != expected_hash:
         raise MutationConflictError(
             f"Conflict: {path} content changed "
             f"(expected sha256 {expected_hash}, actual {actual})"
         )
+
+
+def _ensure_bounded_existing_file(path: str, target: Path) -> None:
+    """Reject an existing mutation target above the workspace file bound."""
+
+    try:
+        oversized = target.exists() and target.stat().st_size > MAX_FILE_SIZE
+    except OSError as exc:
+        raise ValueError("Workspace file could not be inspected safely") from exc
+    if oversized:
+        raise ValueError(f"File too large (maximum {MAX_FILE_SIZE} bytes): {path}")
+
+
+def _read_bounded_file_bytes(path: str, target: Path) -> bytes:
+    """Read one file with a hard byte limit even if it changes after stat."""
+
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(MAX_FILE_SIZE + 1)
+    except OSError as exc:
+        raise ValueError(f"Workspace file could not be read: {path}") from exc
+
+    if len(data) > MAX_FILE_SIZE:
+        raise ValueError(f"File too large (maximum {MAX_FILE_SIZE} bytes): {path}")
+    return data
+
+
+def _decode_utf8_text(path: str, data: bytes) -> str:
+    """Decode with the universal-newline behavior of ``Path.read_text``."""
+
+    try:
+        return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
 
 def _atomic_write_text(target: Path, text: str) -> None:
@@ -534,20 +584,67 @@ def read_file(path: str, root: Path | None = None) -> ReadFileResult:
     if not target.is_file():
         raise ValueError(f"Not a file: {path}")
 
-    size = target.stat().st_size
-
-    if size > MAX_FILE_SIZE:
-        raise ValueError(
-            f"File too large: {size} bytes (maximum {MAX_FILE_SIZE} bytes)"
-        )
-
-    content = target.read_text(encoding="utf-8")
+    data = _read_bounded_file_bytes(path, target)
+    content = _decode_utf8_text(path, data)
 
     return ReadFileResult(
         path=_relative_to_root(root, target),
-        size=size,
-        sha256=_sha256_file(target),
+        size=len(data),
+        sha256=_sha256_bytes(data),
         content=content,
+    )
+
+
+def _list_directory(path: str = ".", root: Path | None = None) -> ListDirectoryResult:
+    """Return one bounded, non-recursive workspace directory listing."""
+
+    root = _effective_root(root)
+    target = resolve_path_within(path, root)
+
+    if not target.exists():
+        raise FileNotFoundError(f"Directory not found: {path}")
+    if not target.is_dir():
+        raise ValueError(f"Not a directory: {path}")
+
+    entries: list[DirectoryEntry] = []
+    try:
+        with os.scandir(target) as iterator:
+            for item in iterator:
+                if len(entries) >= MAX_DIRECTORY_ENTRIES:
+                    raise ValueError(
+                        "Directory contains too many entries "
+                        f"(maximum {MAX_DIRECTORY_ENTRIES})"
+                    )
+
+                if item.is_symlink():
+                    kind = "symlink"
+                    size = None
+                elif item.is_dir(follow_symlinks=False):
+                    kind = "directory"
+                    size = None
+                elif item.is_file(follow_symlinks=False):
+                    kind = "file"
+                    size = item.stat(follow_symlinks=False).st_size
+                else:
+                    kind = "other"
+                    size = None
+
+                entries.append(
+                    DirectoryEntry(
+                        name=item.name,
+                        kind=kind,
+                        size=size,
+                    )
+                )
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"Workspace directory could not be read: {path}") from exc
+
+    entries.sort(key=lambda item: item.name.lower())
+    return ListDirectoryResult(
+        path=_relative_to_root(root, target),
+        entries=entries,
     )
 
 
@@ -567,9 +664,10 @@ def _validate_write_input(
         raise TypeError("Content must be a string")
 
     encoded = content.encode("utf-8")
-    if len(encoded) > MAX_WRITE_BYTES:
+    maximum_write = min(MAX_WRITE_BYTES, MAX_FILE_SIZE)
+    if len(encoded) > maximum_write:
         raise ValueError(
-            f"Content too large: {len(encoded)} bytes (maximum {MAX_WRITE_BYTES})"
+            f"Content too large: {len(encoded)} bytes (maximum {maximum_write})"
         )
 
     target = _resolve_mutation_target(root, path)
@@ -577,6 +675,7 @@ def _validate_write_input(
     if not create_parents and not target.parent.is_dir():
         raise FileNotFoundError(f"Parent directory does not exist: {path}")
 
+    _ensure_bounded_existing_file(path, target)
     _check_expected_hash(path, target, expected_hash)
 
     return target
@@ -600,7 +699,7 @@ def write_file(
     root = _effective_root(root)
     arguments = {
         "path": path,
-        "content_chars": len(content),
+        "content_chars": len(content) if isinstance(content, str) else None,
         "expected_hash": expected_hash,
         "create_parents": create_parents,
     }
@@ -761,10 +860,12 @@ def write_file_approved(request_id: str, root: Path | None = None) -> WriteFileR
             {"path", "content", "expected_hash", "create_parents"},
         )
         validate_workspace_snapshot(payload, root)
-        path = str(payload["path"])
-        content = str(payload["content"])
+        path = payload["path"]
+        content = payload["content"]
         expected_hash = payload.get("expected_hash")
-        create_parents = bool(payload.get("create_parents", False))
+        create_parents = payload.get("create_parents", False)
+        if not isinstance(path, str) or not isinstance(create_parents, bool):
+            raise TypeError("Approval file write snapshot is malformed")
 
         target = _validate_write_input(
             path, content, expected_hash, create_parents, root
@@ -876,14 +977,16 @@ def _validate_patch_input(
 
     target = _resolve_mutation_target(root, path)
 
+    if target.exists():
+        _ensure_bounded_existing_file(path, target)
+
+    _check_expected_hash(path, target, expected_hash)
+
     if not target.exists():
         raise FileNotFoundError(f"File not found: {path}")
-
     # Structural validation: malformed patches and header redirections are
     # rejected before any approval request is created.
     parse_unified_patch(patch, path)
-
-    _check_expected_hash(path, target, expected_hash)
 
     return target
 
@@ -905,8 +1008,10 @@ def apply_patch(
     root = _effective_root(root)
     arguments = {
         "path": path,
-        "patch_chars": len(patch),
-        "patch_sha256": _sha256_bytes(patch.encode("utf-8")),
+        "patch_chars": len(patch) if isinstance(patch, str) else None,
+        "patch_sha256": (
+            _sha256_bytes(patch.encode("utf-8")) if isinstance(patch, str) else None
+        ),
         "expected_hash": expected_hash,
     }
 
@@ -1064,27 +1169,29 @@ def apply_patch_approved(request_id: str, root: Path | None = None) -> ApplyPatc
             request, "file_patch", {"path", "patch", "expected_hash"}
         )
         validate_workspace_snapshot(payload, root)
-        path = str(payload["path"])
-        patch = str(payload["patch"])
+        path = payload["path"]
+        patch = payload["patch"]
         expected_hash = payload.get("expected_hash")
+        if not isinstance(path, str):
+            raise TypeError("Approval file patch snapshot is malformed")
         snapshot_validated = True
 
-        target = _resolve_mutation_target(root, path)
+        target = _validate_patch_input(path, patch, expected_hash, root)
 
-        _check_expected_hash(path, target, expected_hash)
-
-        if not target.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        try:
-            original_text = target.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
+        original_text = _decode_utf8_text(
+            path,
+            _read_bounded_file_bytes(path, target),
+        )
 
         new_text, additions, deletions = apply_patch_text(original_text, patch, path)
 
         bytes_before = len(original_text.encode("utf-8"))
         bytes_after = len(new_text.encode("utf-8"))
+        maximum_write = min(MAX_WRITE_BYTES, MAX_FILE_SIZE)
+        if bytes_after > maximum_write:
+            raise ValueError(
+                f"Patched content is too large (maximum {maximum_write} bytes)"
+            )
         previous_hash = _sha256_file(target)
         changed = new_text != original_text
 
@@ -1203,44 +1310,7 @@ def register_filesystem_tools(mcp: MCPServer) -> None:
     )
     def list_directory(path: str = ".") -> ListDirectoryResult:
         """List files and directories inside the ToolHub workspace."""
-
-        root = get_workspace_root()
-        target = resolve_path_within(path, root)
-
-        if not target.exists():
-            raise FileNotFoundError(f"Directory not found: {path}")
-
-        if not target.is_dir():
-            raise ValueError(f"Not a directory: {path}")
-
-        entries: list[DirectoryEntry] = []
-
-        for item in sorted(target.iterdir(), key=lambda p: p.name.lower()):
-            if item.is_symlink():
-                kind = "symlink"
-                size = None
-            elif item.is_dir():
-                kind = "directory"
-                size = None
-            elif item.is_file():
-                kind = "file"
-                size = item.stat().st_size
-            else:
-                kind = "other"
-                size = None
-
-            entries.append(
-                DirectoryEntry(
-                    name=item.name,
-                    kind=kind,
-                    size=size,
-                )
-            )
-
-        return ListDirectoryResult(
-            path=_relative_to_root(root, target),
-            entries=entries,
-        )
+        return _list_directory(path)
 
     @mcp.tool(
         name="filesystem.write_file",
