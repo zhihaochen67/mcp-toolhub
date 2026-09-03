@@ -574,8 +574,6 @@ def _apply_decision(
     * ``(request, False)`` when the request exists but was not in ``allowed``
       and was therefore left unchanged.
     """
-    current = now or _now()
-
     with _store_lock(store_path):
         store = _read_store(store_path)
         request = store.get(request_id)
@@ -583,6 +581,9 @@ def _apply_decision(
         if request is None:
             return None, False
 
+        # An explicit clock is authoritative; otherwise sample only after the
+        # locked read so time spent waiting or loading cannot bypass expiry.
+        current = now if now is not None else _now()
         if _expired(request, current):
             request.status = ApprovalStatus.EXPIRED
             request.decided_at = current
@@ -698,7 +699,7 @@ def get_request(
             allowed={ApprovalStatus.PENDING, ApprovalStatus.APPROVED},
             new_status=ApprovalStatus.EXPIRED,
             store_path=path,
-            now=current,
+            now=now,
         )
         return request.model_copy(update={"status": ApprovalStatus.EXPIRED})
 
