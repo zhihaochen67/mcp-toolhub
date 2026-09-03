@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -44,7 +45,11 @@ from mcp_toolhub.contracts import (
 from mcp_toolhub.observability.audit import new_trace_id
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.risk import RiskLevel
-from mcp_toolhub.security.state_permissions import open_trusted_file
+from mcp_toolhub.security.state_permissions import (
+    TRUSTED_FILE_MODE,
+    open_trusted_file,
+    secure_trusted_file_descriptor,
+)
 
 if os.name == "nt":
     import msvcrt
@@ -53,7 +58,7 @@ else:
 
 
 class ApprovalStoreError(RuntimeError):
-    """The trusted approval store is malformed or incompatible."""
+    """The trusted approval store is invalid or cannot be accessed securely."""
 
 
 class ApprovalStoreCapacityError(ApprovalStoreError):
@@ -273,43 +278,136 @@ def _read_store(store_path: Path) -> dict[str, ApprovalRequest]:
 
 def _serialize_store(requests: dict[str, ApprovalRequest]) -> bytes:
     """Return the complete deterministic UTF-8 representation persisted to disk."""
-    payload = {
-        "version": STORE_VERSION,
-        "requests": {
-            request_id: request.model_dump(mode="json")
-            for request_id, request in sorted(requests.items())
-        },
-    }
+    try:
+        payload = {
+            "version": STORE_VERSION,
+            "requests": {
+                request_id: request.model_dump(mode="json")
+                for request_id, request in sorted(requests.items())
+            },
+        }
 
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        # Includes Pydantic serialization and UTF-8 encoding errors, but leaves
+        # resource exhaustion (MemoryError) and process interrupts untouched.
+        raise ApprovalStoreError("Approval store could not be serialized.") from exc
+
+
+def _regular_file_info(path: Path) -> os.stat_result | None:
+    """Inspect a publication name without following final-component symlinks."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(
+            errno.EINVAL,
+            "approval store path is not a regular file",
+            os.fspath(path),
+        )
+    return info
+
+
+def _check_file_identity(path: Path, expected: os.stat_result | None) -> None:
+    """Reject a name that appeared, disappeared, or changed since inspection."""
+    current = _regular_file_info(path)
+    if expected is None:
+        if current is not None:
+            raise FileExistsError(
+                errno.EEXIST, "approval store path appeared", os.fspath(path)
+            )
+    elif current is None:
+        raise FileNotFoundError(
+            errno.ENOENT, "approval store path disappeared", os.fspath(path)
+        )
+    elif (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+        raise OSError(
+            getattr(errno, "ESTALE", errno.EIO),
+            "approval store path changed during publication",
+            os.fspath(path),
+        )
+
+
+def _close_store_descriptor(descriptor: int | None) -> None:
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def _write_serialized_store(store_path: Path, serialized: bytes) -> None:
-    """Atomically persist one already-serialized store representation."""
-    store_path.parent.mkdir(parents=True, exist_ok=True)
+    """Publish a complete store under the caller's existing sidecar lock.
 
-    tmp_path = store_path.parent / f".approvals-{secrets.token_hex(8)}.tmp"
+    The runtime supplies a private, validated state directory. POSIX keeps the
+    original target inode open through replacement; Windows uses path identity
+    checks because an open CRT descriptor prevents replacement. These checks
+    detect observed name changes, not an atomic compare-and-swap: the private
+    directory and cooperative lock remain the authority over the final rename
+    window and ancestor paths.
+    """
+    tmp_path: Path | None = None
+    temporary_info: os.stat_result | None = None
+    descriptor: int | None = None
+    target_descriptor: int | None = None
 
     try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        target_info = _regular_file_info(store_path)
+        if os.name == "posix" and target_info is not None:
+            target_descriptor = open_trusted_file(
+                store_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+            )
+            opened = os.fstat(target_descriptor)
+            if (opened.st_dev, opened.st_ino) != (
+                target_info.st_dev,
+                target_info.st_ino,
+            ):
+                raise OSError(errno.EIO, "approval store target changed during open")
+            _check_file_identity(store_path, opened)
+
+        tmp_path = store_path.parent / f".approvals-{secrets.token_hex(8)}.tmp"
         open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-        descriptor = open_trusted_file(tmp_path, open_flags)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Own the descriptor before permission normalization can fail. Exclusive
+        # creation rejects every existing name (including symlinks); a failed
+        # open never grants ownership of a colliding file.
+        descriptor = os.open(tmp_path, open_flags, TRUSTED_FILE_MODE)
+        temporary_info = os.fstat(descriptor)
+        secure_trusted_file_descriptor(descriptor)
+        remaining = memoryview(serialized)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0 or count > len(remaining):
+                raise OSError(errno.EIO, "approval store write made invalid progress")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+        _check_file_identity(tmp_path, temporary_info)
+        # Windows requires the temporary descriptor closed before replacement.
+        if os.name == "nt":
+            closing_descriptor, descriptor = descriptor, None
+            os.close(closing_descriptor)
 
+        _check_file_identity(store_path, target_info)
         os.replace(tmp_path, store_path)
-
-    except BaseException as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        if isinstance(exc, OSError):
-            raise ApprovalStoreError(
-                "Approval store could not be persisted securely."
-            ) from exc
-        raise
+        temporary_info = None  # Publication transferred ownership to the store.
+    except (OSError, ValueError) as exc:
+        raise ApprovalStoreError(
+            "Approval store could not be persisted securely."
+        ) from exc
+    finally:
+        if os.name == "nt":
+            _close_store_descriptor(descriptor)
+            descriptor = None
+        if tmp_path is not None and temporary_info is not None:
+            try:
+                # Do not delete a different file placed at our temporary name.
+                _check_file_identity(tmp_path, temporary_info)
+                tmp_path.unlink()
+            except OSError:
+                pass  # Best effort; never mask the original failure.
+        _close_store_descriptor(descriptor)
+        _close_store_descriptor(target_descriptor)
 
 
 def _write_store(

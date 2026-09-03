@@ -539,19 +539,19 @@ def test_binding_permission_failure_maps_to_configuration_error(
 
 def test_approval_permission_failure_maps_to_store_error(temp_dir, monkeypatch):
     store_path = temp_dir / "approvals.json"
-    original_open = approval.open_trusted_file
 
-    def fail_temporary(path, flags, mode=0o600):
-        if Path(path).suffix == ".tmp":
-            raise PermissionError("simulated approval permission failure")
-        return original_open(path, flags, mode)
+    def fail_temporary(_descriptor):
+        raise PermissionError("simulated approval permission failure")
 
     with monkeypatch.context() as scoped_monkeypatch:
-        scoped_monkeypatch.setattr(approval, "open_trusted_file", fail_temporary)
+        scoped_monkeypatch.setattr(
+            approval, "secure_trusted_file_descriptor", fail_temporary
+        )
         with pytest.raises(approval.ApprovalStoreError) as captured:
             _create_approval(store_path)
 
     assert isinstance(captured.value.__cause__, PermissionError)
+    assert not list(temp_dir.glob(".approvals-*.tmp"))
 
 
 def test_audit_permission_failure_remains_non_fatal(temp_dir, monkeypatch):
