@@ -258,6 +258,9 @@ shell command string.
 
 ## Trusted state maintenance
 
+For an audit log that exceeds the 64 MiB compaction-read ceiling, follow the
+[audit maintenance recovery runbook](docs/audit-maintenance-recovery.md).
+
 Trusted-state pruning is explicit, human-operated maintenance through
 `mcp-toolhub-admin`; it never runs at server startup or from an environment
 toggle. Both commands are dry runs unless `--apply` is supplied:
@@ -558,6 +561,9 @@ configuration, and server/admin shared-state tests from outside the repository.
   not print banners or logs to stdout.
 - **Admin cannot see a request**: confirm server and admin run as the same user
   with identical workspace and state-root settings.
+- **Audit log exceeds the safe compaction read limit**: follow the
+  [audit maintenance recovery runbook](docs/audit-maintenance-recovery.md)
+  to archive the log with all writers stopped and resume auditing safely.
 - **Executable changed after approval**: request a new approval; consumed or
   invalidated approvals are never replayed.
 
