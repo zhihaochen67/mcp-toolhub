@@ -12,8 +12,8 @@ Security / privacy properties
   no raw stdout/stderr (only their character counts and bounded capture byte
   counters), and argument values are truncated and redacted when they look
   like secrets.
-* ``record_event`` never raises: if the log cannot be written, the failure is
-  swallowed so auditing can never break the main tool path.
+* ``record_event`` treats logging failures as non-fatal so auditing cannot
+  break the main tool path. Process interrupts and resource exhaustion propagate.
 * This module has no MCP dependency: MCP-facing surfaces (e.g. the read-only
   ``toolhub.audit_recent`` tool) live in ``mcp_toolhub.tools.audit``.
 """
@@ -277,6 +277,59 @@ def _enum_value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
 
+def _open_audit_for_append(path: Path) -> int:
+    """Open a trusted log or exclusively create it, revalidating any collision."""
+    open_flags = (
+        os.O_APPEND
+        | os.O_WRONLY
+        | getattr(os, "O_BINARY", 0)
+        # A FIFO must not block before the trusted primitive can reject its type.
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        return open_trusted_file(path, open_flags)
+    except FileNotFoundError:
+        try:
+            return open_trusted_file(path, open_flags | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            # Another creator won the name. Apply the same trusted existing-file
+            # checks, including permission normalization, before appending.
+            return open_trusted_file(path, open_flags)
+
+
+def _append_audit_line(path: Path, encoded_line: bytes) -> None:
+    """Durably append under the caller's audit lock; roll back failures in place."""
+    descriptor: int | None = None
+    original_size: int | None = None
+
+    try:
+        descriptor = _open_audit_for_append(path)
+        original_size = os.fstat(descriptor).st_size
+        remaining = memoryview(encoded_line)
+        while remaining:
+            count = os.write(descriptor, remaining)
+            if count <= 0 or count > len(remaining):
+                raise OSError(errno.EIO, "audit append made invalid progress")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+    except BaseException:
+        # Cleanup also runs for interrupts/resource exhaustion, then re-raises.
+        # Attempt rollback even if write raised without reporting its byte count.
+        if descriptor is not None and original_size is not None:
+            try:
+                os.ftruncate(descriptor, original_size)
+                os.fsync(descriptor)
+            except OSError:
+                pass  # Best effort; preserve the append failure.
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def record_event(
     *,
     tool: str,
@@ -301,9 +354,9 @@ def record_event(
 ) -> bool:
     """Append one audit event to the JSONL log.
 
-    Never raises: any logging failure returns ``False`` and is otherwise
-    ignored, so tool execution can never be broken by the audit subsystem.
-    Returns ``True`` when the event was appended successfully.
+    Logging failures return ``False`` without breaking tool execution. Process
+    interrupts and ``MemoryError`` propagate after descriptor cleanup.
+    Returns ``True`` only after the complete event has been appended and fsynced.
     """
     try:
         event: dict[str, Any] = {
@@ -345,19 +398,17 @@ def record_event(
         path = audit_path or _default_audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        line = (
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
 
         with _audit_write_lock(path):
-            open_flags = (
-                os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-            )
-            descriptor = open_trusted_file(path, open_flags)
-            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                handle.write(line)
-                handle.flush()
+            _append_audit_line(path, line)
 
         return True
 
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001 - audit is a non-fatal boundary
         # Defensive: audit must never break tool execution.
         return False
