@@ -19,6 +19,10 @@ Every git subprocess is launched with the same read-only posture:
 * ``GIT_TERMINAL_PROMPT=0`` — no interactive prompting.
 * ``--no-ext-diff`` / ``--no-textconv`` (diff) — repository-configured
   external diff helpers and textconv filters never execute.
+* Bounded effective-config and attribute inspection refuses tracked paths
+  selecting executable clean/process filters. Unrelated drivers remain usable.
+  Gitlinks in the index or HEAD are refused before nested inspection.
+* Missing promisor objects cannot start transport helpers during inspection.
 * ``stdin=DEVNULL``, ``shell=False``, a hard timeout, and continuously
   drained, memory-bounded output capture for everything else (excess output
   is discarded while the pipes are still read, so Git can never fill an OS
@@ -39,6 +43,7 @@ is addressed at that repository's location.
 
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -65,6 +70,13 @@ GIT_MAX_OUTPUT_CHARS = 20_000
 GIT_MAX_ERROR_CHARS = 500
 GIT_MAX_STATUS_ENTRIES = 1_024
 GIT_MAX_PATH_CHARS = 4_096
+GIT_MAX_FILTER_CONFIG_ENTRIES = 256
+GIT_MAX_FILTER_SCAN_ENTRIES = 4_096
+GIT_MAX_ATTRIBUTE_BATCH_CHARS = 8_192
+GIT_MAX_FILTER_OPTION_CHARS = 8_192
+
+_FILTER_CONFIG_PATTERN = r"^filter\..*\.(clean|process)$"
+_FILTER_CONFIG_KEY = re.compile(r"^filter\.(.+)\.(clean|process)$")
 
 # Global options applied to every read-only git subprocess. These must come
 # before the subcommand.
@@ -81,6 +93,11 @@ _GIT_ENV_EXTRA = {
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_PAGER": "cat",
+    # Attribute/tree reads in a partial clone must not start a transport helper.
+    # Older Git versions do not understand NO_LAZY_FETCH; ALLOW_PROTOCOL also
+    # denies every transport, including repository-configured SSH/ext helpers.
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_ALLOW_PROTOCOL": "",
 }
 
 
@@ -189,7 +206,12 @@ def _resolve_repo_path(root: Path, path: str) -> Path:
     return target
 
 
-def _run_git(root: Path, argv: list[str]) -> _RunGitResult:
+def _run_git(
+    root: Path,
+    argv: list[str],
+    *,
+    timeout_seconds: float = GIT_TIMEOUT_SECONDS,
+) -> _RunGitResult:
     """Run a git subcommand with the hardened read-only posture."""
     located = shutil.which("git")
     if located is None:
@@ -209,7 +231,7 @@ def _run_git(root: Path, argv: list[str]) -> _RunGitResult:
             [*_GIT_GLOBAL_ARGS, *argv],
             cwd=root,
             env=environment,
-            timeout_seconds=GIT_TIMEOUT_SECONDS,
+            timeout_seconds=timeout_seconds,
         )
     except ProcessContainmentError as exc:
         raise ValueError(
@@ -353,6 +375,190 @@ def _require_contained_worktree(worktree_root: Path, boundary: Path) -> Path:
     return worktree_root
 
 
+def _preflight_output(
+    root: Path,
+    argv: list[str],
+    deadline: float,
+    *,
+    allow_missing: bool = False,
+) -> str:
+    """Read complete plumbing output within one shared inspection deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Git helper safety inspection timed out")
+    completed = _run_git(root, argv, timeout_seconds=remaining)
+    if (
+        completed.stdout_truncated
+        or completed.stdout_dropped_bytes
+        or completed.stderr
+        or completed.returncode not in ({0, 1} if allow_missing else {0})
+        or (completed.returncode == 1 and completed.stdout)
+    ):
+        # Neither config values nor plumbing diagnostics are public metadata.
+        raise GitCommandError(
+            "Git helper safety inspection failed or exceeded safe limits"
+        )
+    return completed.stdout
+
+
+def _nul_records(raw: str, limit: int) -> list[str]:
+    if not raw:
+        return []
+    if not raw.endswith("\0") or raw.count("\0") > limit:
+        raise GitCommandError("Git helper safety metadata exceeds safe limits")
+    return raw[:-1].split("\0")
+
+
+def _executable_filter_drivers(raw: str) -> set[str]:
+    """Resolve last-value precedence, including process overriding clean."""
+    drivers: dict[str, dict[str, str]] = {}
+    for record in _nul_records(raw, GIT_MAX_FILTER_CONFIG_ENTRIES):
+        key, separator, value = record.partition("\n")
+        match = _FILTER_CONFIG_KEY.fullmatch(key)
+        if not separator or match is None:
+            raise GitCommandError("Git filter configuration cannot be inspected safely")
+        name, operation = match.groups()
+        if (
+            len(name) > 128
+            or "=" in name
+            or "\ufffd" in name
+            or any(ord(character) < 32 for character in name)
+        ):
+            raise GitCommandError("Git filter configuration cannot be inspected safely")
+        drivers.setdefault(name, {})[operation] = value
+    return {
+        name
+        for name, operations in drivers.items()
+        if operations.get("process", operations.get("clean", ""))
+    }
+
+
+def _inspection_paths(raw: str, *, tree: bool = False) -> list[str]:
+    """Decode bounded index/tree entries without materializing file contents."""
+    paths: dict[str, None] = {}
+    for record in _nul_records(raw, GIT_MAX_FILTER_SCAN_ENTRIES):
+        metadata, separator, path = record.partition("\t")
+        fields = metadata.split(" ")
+        if (
+            not separator
+            or len(fields) != 3
+            or fields[0] not in {"100644", "100755", "120000", "160000"}
+            or (tree and fields[1] != ("commit" if fields[0] == "160000" else "blob"))
+            or (not tree and fields[2] not in {"0", "1", "2", "3"})
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields[2 if tree else 1])
+            or not path
+            or len(path) > GIT_MAX_PATH_CHARS
+            or "\ufffd" in path
+            or any(ord(character) < 32 for character in path)
+            or is_portably_rooted_path(path)
+            or has_portable_parent_reference(path)
+        ):
+            raise GitCommandError("Git tracked paths cannot be inspected safely")
+        if fields[0] == "160000":
+            raise GitCommandError(
+                "Read-only Git inspection refused: submodule helper safety "
+                "cannot be established without recursive inspection"
+            )
+        paths[path] = None
+    return list(paths)
+
+
+def _filter_safety_options(
+    root: Path, *, path: str | None = None, staged: bool = False
+) -> list[str]:
+    """Refuse applicable executable filters before status/diff can run them.
+
+    Git resolves includes, config precedence, attribute macros, nested files,
+    info/attributes and index fallback. Do not parse .git/config or implement
+    attribute matching ourselves. Index and HEAD gitlinks are refused because
+    the final commands can otherwise run nested Git with separate config.
+
+    This is a bounded preflight over a cooperating workspace, not an atomic
+    snapshot against hostile concurrent config/index/attribute replacement.
+    Known executable drivers are additionally made required-but-unavailable
+    for the final command: newly selecting one must fail, never silently
+    compare unfiltered bytes or execute its helper.
+    """
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    configured = _preflight_output(
+        root,
+        ["config", "--includes", "--null", "--get-regexp", _FILTER_CONFIG_PATTERN],
+        deadline,
+        allow_missing=True,
+    )
+    drivers = _executable_filter_drivers(configured)
+    paths = _inspection_paths(
+        _preflight_output(root, ["ls-files", "--stage", "-z"], deadline)
+    )
+    head = _preflight_output(
+        root, ["rev-parse", "--verify", "--quiet", "HEAD"], deadline, allow_missing=True
+    ).strip()
+    if head:
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            raise GitCommandError("Git HEAD cannot be inspected safely")
+        _inspection_paths(
+            _preflight_output(
+                root, ["ls-tree", "-r", "-z", "--full-tree", head], deadline
+            ),
+            tree=True,
+        )
+
+    if not drivers:
+        return []
+    if staged:
+        # --cached compares stored objects, without cleaning worktree content.
+        paths = []
+    elif path is not None:
+        # Let Git apply exactly the same pathspec as the final diff. The final
+        # required-but-unavailable guards also cover any extra paths a Git
+        # version might refresh outside that pathspec: it must fail in that case.
+        paths = _inspection_paths(
+            _preflight_output(root, ["ls-files", "--stage", "-z", "--", path], deadline)
+        )
+    while paths:
+        batch: list[str] = []
+        size = 0
+        while (
+            paths
+            and size + len(paths[-1].encode("utf-8")) + 1
+            <= GIT_MAX_ATTRIBUTE_BATCH_CHARS
+        ):
+            path = paths.pop()
+            batch.append(path)
+            size += len(path.encode("utf-8")) + 1
+        if not batch:
+            raise GitCommandError("Git attribute paths exceed safe inspection limits")
+        raw = _preflight_output(
+            root, ["check-attr", "-z", "filter", "--", *batch], deadline
+        )
+        records = _nul_records(raw, 3 * len(batch))
+        if len(records) != 3 * len(batch):
+            raise GitCommandError(
+                "Git attribute inspection returned incomplete results"
+            )
+        for index, path in enumerate(batch):
+            returned_path, attribute, value = records[3 * index : 3 * index + 3]
+            if returned_path != path or attribute != "filter":
+                raise GitCommandError(
+                    "Git attribute inspection returned invalid results"
+                )
+            if value in drivers:
+                raise GitCommandError(
+                    "Read-only Git inspection refused: a tracked file selects "
+                    "an executable clean/process filter"
+                )
+    options: list[str] = []
+    for name in sorted(drivers):
+        for setting in ("clean=", "process=", "required=true"):
+            options.extend(["-c", f"filter.{name}.{setting}"])
+    if (
+        sum(len(option.encode("utf-8")) + 3 for option in options)
+        > GIT_MAX_FILTER_OPTION_CHARS
+    ):
+        raise GitCommandError("Git filter configuration exceeds safe invocation limits")
+    return options
+
+
 def _parse_status(raw: str) -> tuple[str | None, list[GitStatusEntry]]:
     branch: str | None = None
     entries: list[GitStatusEntry] = []
@@ -429,7 +635,10 @@ def git_status(root: Path | None = None) -> GitStatusResult:
         raise
 
     try:
-        completed = _run_git(worktree_root, ["status", "--porcelain=v1", "--branch"])
+        filter_options = _filter_safety_options(worktree_root)
+        completed = _run_git(
+            worktree_root, [*filter_options, "status", "--porcelain=v1", "--branch"]
+        )
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
             trace_id,
@@ -542,7 +751,8 @@ def git_diff(
         raise
 
     try:
-        completed = _run_git(worktree_root, argv)
+        filter_options = _filter_safety_options(worktree_root, path=path, staged=staged)
+        completed = _run_git(worktree_root, [*filter_options, *argv])
     except (ValueError, TimeoutError) as exc:
         _audit_failure(
             trace_id,
