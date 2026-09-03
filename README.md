@@ -302,6 +302,32 @@ or Contract V1 surface.
 
 ## Security model and limitations
 
+### Workspace atomic-write permissions
+
+Approved file writes and patches create an exclusive same-directory temporary
+file, write and flush its content, set its final POSIX mode, fsync, and publish
+with `os.replace`. On POSIX, an existing regular file retains only ordinary
+owner/group/other read, write, and execute permissions (`st_mode & 0o777`),
+including executable bits. Setuid, setgid, and sticky bits are cleared on the
+replacement inode, so newly written content does not inherit special bits.
+New files use `0600`, with no executable permissions. The temporary file is
+created with `0600` and explicitly secured through its descriptor before content
+is written, independent of the process umask. Ordinary target permissions are
+applied only after writing, immediately before fsync and publication.
+
+No-follow metadata checks reject non-regular targets and detect target
+creation, disappearance, inode replacement, or mode/content-metadata changes
+during preparation. A detected change or permission-setup failure prevents
+publication and triggers cleanup of the owned temporary file. These checks do
+not make permission copying and publication an atomic compare-and-swap:
+concurrent changes after the final check, including ancestor-directory swaps,
+remain possible in the existing pathname-based model.
+
+This policy preserves ordinary POSIX rwx bits, not ownership, extended attributes,
+or ACLs. Windows retains its existing file creation and replacement behavior;
+POSIX chmod semantics are not emulated, and Windows ACL preservation is neither
+implemented nor guaranteed.
+
 ### Read-only Git helper policy
 
 `git.status` and `git.diff` inspect effective Git configuration (including

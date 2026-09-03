@@ -31,6 +31,7 @@ import hashlib
 import os
 import re
 import secrets
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,24 +258,102 @@ def _decode_utf8_text(path: str, data: bytes) -> str:
         raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
 
+def _replacement_target_stat(target: Path) -> os.stat_result | None:
+    """Inspect the final component without following symlinks."""
+    try:
+        metadata = target.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("Mutation target must be a regular file")
+    return metadata
+
+
+def _check_replacement_target(target: Path, before: os.stat_result | None) -> None:
+    current = _replacement_target_stat(target)
+    if before is None and current is None:
+        return
+    if (
+        before is not None
+        and current is not None
+        and os.path.samestat(before, current)
+        and before.st_mode == current.st_mode
+        and before.st_size == current.st_size
+        and before.st_mtime_ns == current.st_mtime_ns
+        and before.st_ctime_ns == current.st_ctime_ns
+    ):
+        return
+    raise MutationConflictError("Conflict: mutation target changed before replacement")
+
+
+def _set_replacement_mode(descriptor: int, mode: int) -> None:
+    """Set and verify POSIX mode on the owned descriptor, never on a path."""
+    os.fchmod(descriptor, mode)
+    if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+        raise PermissionError("Replacement file permissions could not be set")
+
+
 def _atomic_write_text(target: Path, text: str) -> None:
-    """Atomically replace ``target``: temp file in the same directory,
-    fsync, then ``os.replace``. Never leaves a partial file behind."""
+    """Write, flush, set permissions, fsync, then atomically replace the target.
+
+    POSIX preserves only ordinary rwx permissions (0777), including executable
+    bits, and clears setuid/setgid/sticky. New files use 0600, with no execute bits.
+    Temps are created privately regardless of umask and stay 0600 until the
+    complete content is ready; only then are ordinary target permissions applied.
+    Windows keeps ordinary exclusive creation and replacement behavior: POSIX
+    modes are not Windows ACLs, and ACL preservation is not implemented here.
+
+    No-follow target snapshots detect inode, mode, and content-metadata changes
+    during preparation. The final check and replace are not an atomic CAS:
+    concurrent changes after that check (including ancestor swaps) remain a
+    limitation of the existing pathname-based containment/publication model.
+    """
+    before = _replacement_target_stat(target)
+    posix = os.name == "posix"
+    mode = before.st_mode & 0o777 if before is not None else 0o600
     tmp_path = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+    owned = False
+    temporary_stat = None
+
+    def open_temporary(path: str, flags: int) -> int:
+        nonlocal owned
+        # open(..., "x") supplies O_CREAT | O_EXCL, including no following of
+        # an existing final-component symlink. Windows retains its usual 0666.
+        descriptor = os.open(path, flags, 0o600 if posix else 0o666)
+        owned = True
+        return descriptor
 
     try:
-        with open(tmp_path, "x", encoding="utf-8", newline="") as handle:
+        with open(
+            tmp_path, "x", encoding="utf-8", newline="", opener=open_temporary
+        ) as handle:
+            temporary_stat = os.fstat(handle.fileno())
+            if posix:
+                # Restore owner access even under a restrictive umask, before
+                # any content is written. Never change the process umask.
+                _set_replacement_mode(handle.fileno(), 0o600)
             handle.write(text)
             handle.flush()
+            _check_replacement_target(target, before)
+            if posix:
+                # Apply only ordinary rwx permissions after content is ready.
+                _set_replacement_mode(handle.fileno(), mode)
             os.fsync(handle.fileno())
 
+        _check_replacement_target(target, before)
+        if not os.path.samestat(temporary_stat, tmp_path.lstat()):
+            raise MutationConflictError("Conflict: replacement temporary file changed")
         os.replace(tmp_path, target)
 
     except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if owned:
+            try:
+                if temporary_stat is None or os.path.samestat(
+                    temporary_stat, tmp_path.lstat()
+                ):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
 
