@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from mcp_toolhub.security.paths import get_state_root
 from mcp_toolhub.security.state_permissions import open_trusted_file
@@ -50,6 +50,7 @@ MAX_READ_EVENTS = 100
 MAX_READ_BYTES = 1_000_000
 MAX_COMPACTION_EVENTS = 100_000
 MAX_COMPACTION_LINE_BYTES = 1_000_000
+MAX_COMPACTION_READ_BYTES = 64 * 1024 * 1024
 
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 _AUDIT_LOCK_RETRY_SECONDS = 0.05
@@ -414,14 +415,50 @@ def record_event(
         return False
 
 
+def _compaction_chunks(handle: BinaryIO, *, position: int = 0) -> Iterator[bytes]:
+    """Bound source reads, including growth after the descriptor size preflight.
+
+    Callers use unbuffered binary handles so reads cannot prefetch past the
+    budget. Recheck size at EOF or budget exhaustion without a one-byte probe.
+    The existing audit lock serializes cooperating append/compaction writers.
+    """
+    if os.fstat(handle.fileno()).st_size > MAX_COMPACTION_READ_BYTES:
+        raise AuditMaintenanceError("Audit log exceeds the safe compaction read limit.")
+
+    while position < MAX_COMPACTION_READ_BYTES:
+        chunk = handle.read(min(64 * 1024, MAX_COMPACTION_READ_BYTES - position))
+        if not chunk:
+            break
+        position += len(chunk)
+        yield chunk
+
+    final_size = os.fstat(handle.fileno()).st_size
+    if final_size > MAX_COMPACTION_READ_BYTES:
+        raise AuditMaintenanceError("Audit log exceeds the safe compaction read limit.")
+    if final_size != position:
+        raise AuditMaintenanceError("Audit log changed while reading for compaction.")
+
+
+def _compaction_lines(handle: BinaryIO) -> Iterator[bytes]:
+    """Split bounded chunks into JSONL lines without accumulating oversized lines."""
+    pending = b""
+    for chunk in _compaction_chunks(handle):
+        *lines, pending = (pending + chunk).split(b"\n")
+        for line in lines:
+            yield line + b"\n"
+        if len(pending) > MAX_COMPACTION_LINE_BYTES:
+            raise AuditMaintenanceError(
+                "Audit log contains an oversized or incomplete event."
+            )
+    if pending:
+        yield pending
+
+
 def _scan_for_compaction(
     path: Path,
     keep_last: int,
 ) -> _AuditScan:
     """Validate the complete JSONL file and locate the retained byte suffix."""
-    if not path.exists():
-        return _AuditScan(total=0, retained=0, retained_offset=0)
-
     offsets: deque[int] = deque(maxlen=max(1, keep_last))
     total = 0
     position = 0
@@ -431,11 +468,14 @@ def _scan_for_compaction(
             path,
             os.O_RDONLY | getattr(os, "O_BINARY", 0),
         )
-        with os.fdopen(descriptor, "rb") as handle:
-            while True:
-                line = handle.readline(MAX_COMPACTION_LINE_BYTES + 1)
-                if not line:
-                    break
+    except FileNotFoundError:
+        return _AuditScan(total=0, retained=0, retained_offset=0)
+    except OSError as exc:
+        raise AuditMaintenanceError("Audit log could not be read safely.") from exc
+
+    try:
+        with os.fdopen(descriptor, "rb", buffering=0) as handle:
+            for line in _compaction_lines(handle):
                 if len(line) > MAX_COMPACTION_LINE_BYTES:
                     raise AuditMaintenanceError(
                         "Audit log contains an oversized or incomplete event."
@@ -489,14 +529,14 @@ def _write_compacted_audit(
             path,
             os.O_RDONLY | getattr(os, "O_BINARY", 0),
         )
-        with os.fdopen(source_descriptor, "rb") as source:
+        with os.fdopen(source_descriptor, "rb", buffering=0) as source:
             destination_descriptor = open_trusted_file(
                 temporary,
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
             )
             with os.fdopen(destination_descriptor, "wb") as destination:
                 source.seek(retained_offset)
-                while chunk := source.read(1024 * 1024):
+                for chunk in _compaction_chunks(source, position=retained_offset):
                     destination.write(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
