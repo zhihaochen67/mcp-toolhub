@@ -3,8 +3,8 @@
 Use this runbook when `audit.jsonl` exceeds the **64 MiB (67,108,864 bytes)**
 compaction-read ceiling. Recovery is an offline administrator filesystem
 operation; ToolHub has no rotation or oversized-log recovery command.
-For configuration and routine maintenance, see the
-[README](../README.md#trusted-state-maintenance).
+For configuration and routine maintenance, see
+[Operations](operations.md#maintenance).
 
 ## Symptoms
 
