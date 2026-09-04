@@ -89,6 +89,19 @@ def _helper(repo: Path, operation: str) -> tuple[str, Path]:
     return command, marker
 
 
+def _transport_helper(repo: Path) -> tuple[str, Path]:
+    """Create a fast failing SSH command using only shell built-ins.
+
+    A missing promisor object makes Git probe and retry the configured SSH
+    command several times. Avoiding a Python process for every attempt keeps
+    the positive-control path deterministic on Windows while retaining the
+    observable external-helper side effect.
+    """
+    marker = repo / ".git" / "private-helper-marker"
+    command = f"printf executed > {shlex.quote(marker.as_posix())} && false"
+    return command, marker
+
+
 def _inspect(repo: Path, tool: str):
     return (
         git_tools.git_status(root=repo)
@@ -342,7 +355,7 @@ def test_missing_promisor_object_cannot_start_transport_helper(
     object_path = filter_repo / ".git/objects" / blob[:2] / blob[2:]
     object_path.chmod(0o600)  # Git marks loose objects read-only on Windows.
     object_path.unlink()
-    command, marker = _helper(filter_repo, "process")
+    command, marker = _transport_helper(filter_repo)
     _git(filter_repo, "config", "remote.origin.url", "ssh://example.invalid/repo")
     _git(filter_repo, "config", "remote.origin.promisor", "true")
     _git(filter_repo, "config", "core.sshCommand", command)
