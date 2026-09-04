@@ -4,14 +4,33 @@ version = "0.1.0"
 description = "A secure stdio MCP gateway for workspace, Git, and approved command tools"
 readme = "README.md"
 authors = [
-    { name = "asxvgxkep", email = "2212448547@qq.com" }
+    { name = "Zhihao Chen", email = "2212448547@qq.com" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["developer-tools", "gateway", "git", "mcp", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control :: Git",
+]
 dependencies = [
     "mcp>=2,<3",
     "platformdirs>=4,<5",
     "pydantic>=2.12,<3",
 ]
+
+[project.urls]
+Repository = "https://github.com/zhihaochen67/mcp-toolhub"
+Issues = "https://github.com/zhihaochen67/mcp-toolhub/issues"
+Documentation = "https://github.com/zhihaochen67/mcp-toolhub/tree/main/docs"
 
 [project.scripts]
 mcp-toolhub = "mcp_toolhub.cli:main"
