@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">MCP ToolHub architecture and trust boundaries</title>
+  <desc id="desc">An untrusted MCP client connects over stdio to ToolHub. Read-only tools inspect a workspace. Mutations and external commands create immutable pending requests in trusted state. A separate human administrator approves or rejects them, after which the client resumes a single-use execution that is audited.</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      text { font-family: "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .zone-label { font-size: 13px; font-weight: 700; letter-spacing: 1.2px; }
+      .title { font-size: 20px; font-weight: 700; }
+      .subtitle { font-size: 13px; fill: #526078; }
+      .box-title { font-size: 15px; font-weight: 700; }
+      .body { font-size: 13px; }
+      .small { font-size: 12px; fill: #526078; }
+      .code { font-family: Consolas, "Liberation Mono", monospace; font-size: 12px; }
+      .flow { fill: none; stroke-width: 2.2; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="760" fill="#ffffff"/>
+  <text x="48" y="42" class="title">MCP ToolHub — local execution and approval boundary</text>
+  <text x="48" y="66" class="subtitle">stdio only · trusted state outside the workspace · no MCP approval tool</text>
+
+  <!-- Agent-controlled zone -->
+  <rect x="45" y="102" width="220" height="228" rx="14" fill="#fff7f7" stroke="#dc6b6b" stroke-width="2"/>
+  <text x="65" y="130" class="zone-label" fill="#a52a2a">UNTRUSTED / AGENT-CONTROLLED</text>
+  <rect x="70" y="158" width="170" height="72" rx="10" fill="#ffffff" stroke="#dc6b6b"/>
+  <text x="155" y="188" text-anchor="middle" class="box-title">MCP client</text>
+  <text x="155" y="211" text-anchor="middle" class="small">proposes · polls · resumes</text>
+  <rect x="70" y="254" width="170" height="49" rx="8" fill="#fee2e2" stroke="#dc6b6b"/>
+  <text x="155" y="274" text-anchor="middle" class="body" font-weight="700">NO approve / reject</text>
+  <text x="155" y="292" text-anchor="middle" class="small">MCP endpoint</text>
+
+  <!-- ToolHub zone -->
+  <rect x="330" y="102" width="520" height="405" rx="14" fill="#f4f8ff" stroke="#4f7fd6" stroke-width="2"/>
+  <text x="354" y="130" class="zone-label" fill="#2456a6">MCP TOOLHUB</text>
+  <rect x="355" y="151" width="470" height="58" rx="9" fill="#dbeafe" stroke="#4f7fd6"/>
+  <text x="590" y="176" text-anchor="middle" class="box-title">stdio MCP server</text>
+  <text x="590" y="197" text-anchor="middle" class="small">14 tools · Contract V1 · no HTTP/SSE listener</text>
+
+  <rect x="355" y="234" width="215" height="105" rx="9" fill="#ecfdf5" stroke="#4d9a72"/>
+  <text x="462" y="260" text-anchor="middle" class="box-title">Read-only inspection</text>
+  <text x="374" y="285" class="body">filesystem read / list</text>
+  <text x="374" y="307" class="body">Git status / diff</text>
+  <text x="374" y="329" class="small">control + sanitized audit reads</text>
+
+  <rect x="595" y="234" width="230" height="105" rx="9" fill="#fff8e8" stroke="#d59b37"/>
+  <text x="710" y="260" text-anchor="middle" class="box-title">Approval submission</text>
+  <text x="614" y="285" class="body">file mutation / external command</text>
+  <text x="614" y="307" class="code">APPROVAL_REQUIRED</text>
+  <text x="614" y="329" class="small">no action executes here</text>
+
+  <rect x="475" y="374" width="230" height="104" rx="9" fill="#eef2ff" stroke="#6c72c7"/>
+  <text x="590" y="400" text-anchor="middle" class="box-title">Approved resume path</text>
+  <text x="494" y="425" class="body">request_id only</text>
+  <text x="494" y="447" class="body">atomic single-use consumption</text>
+  <text x="494" y="468" class="small">stored snapshot → execute → audit</text>
+
+  <!-- Workspace zone -->
+  <rect x="915" y="102" width="240" height="237" rx="14" fill="#f3fbf6" stroke="#4d9a72" stroke-width="2"/>
+  <text x="939" y="130" class="zone-label" fill="#23653f">WORKSPACE</text>
+  <rect x="940" y="159" width="190" height="65" rx="9" fill="#ffffff" stroke="#4d9a72"/>
+  <text x="1035" y="187" text-anchor="middle" class="box-title">Filesystem</text>
+  <text x="1035" y="209" text-anchor="middle" class="small">bounded relative paths</text>
+  <rect x="940" y="247" width="190" height="65" rx="9" fill="#ffffff" stroke="#4d9a72"/>
+  <text x="1035" y="275" text-anchor="middle" class="box-title">Git repository</text>
+  <text x="1035" y="297" text-anchor="middle" class="small">fixed read-only helpers</text>
+
+  <!-- Trusted state zone -->
+  <rect x="690" y="558" width="465" height="157" rx="14" fill="#faf5ff" stroke="#8b5fb3" stroke-width="2"/>
+  <text x="714" y="586" class="zone-label" fill="#6e3d96">TRUSTED STATE — OUTSIDE WORKSPACE</text>
+  <rect x="714" y="607" width="130" height="75" rx="8" fill="#ffffff" stroke="#8b5fb3"/>
+  <text x="779" y="634" text-anchor="middle" class="box-title">Approvals</text>
+  <text x="779" y="655" text-anchor="middle" class="small">immutable payload</text>
+  <text x="779" y="672" text-anchor="middle" class="small">expiring · single-use</text>
+  <rect x="858" y="607" width="130" height="75" rx="8" fill="#ffffff" stroke="#8b5fb3"/>
+  <text x="923" y="634" text-anchor="middle" class="box-title">Binding</text>
+  <text x="923" y="657" text-anchor="middle" class="small">one workspace</text>
+  <rect x="1002" y="607" width="130" height="75" rx="8" fill="#ffffff" stroke="#8b5fb3"/>
+  <text x="1067" y="634" text-anchor="middle" class="box-title">Audit log</text>
+  <text x="1067" y="655" text-anchor="middle" class="small">bounded · redacted</text>
+  <text x="1067" y="672" text-anchor="middle" class="small">trace-correlated</text>
+
+  <!-- Human boundary -->
+  <rect x="45" y="558" width="530" height="157" rx="14" fill="#fffaf0" stroke="#d59b37" stroke-width="2"/>
+  <text x="69" y="586" class="zone-label" fill="#8c5a06">TRUSTED HUMAN BOUNDARY</text>
+  <rect x="70" y="607" width="210" height="75" rx="9" fill="#ffffff" stroke="#d59b37"/>
+  <text x="175" y="635" text-anchor="middle" class="box-title">mcp-toolhub-admin</text>
+  <text x="175" y="658" text-anchor="middle" class="small">list · approve · reject</text>
+  <rect x="305" y="607" width="245" height="75" rx="9" fill="#fffbeb" stroke="#d59b37"/>
+  <text x="427" y="635" text-anchor="middle" class="box-title">Human reviews candidate</text>
+  <text x="427" y="658" text-anchor="middle" class="small">types APPROVE exactly</text>
+
+  <!-- Flows -->
+  <path d="M 240 194 L 355 194" class="flow" stroke="#2563eb" marker-end="url(#arrow-blue)"/>
+  <text x="297" y="181" text-anchor="middle" class="code" fill="#2563eb">stdio</text>
+
+  <path d="M 570 286 L 580 286 L 580 220 L 900 220 L 900 190 L 940 190" class="flow" stroke="#15803d" marker-end="url(#arrow-green)"/>
+  <text x="750" y="216" text-anchor="middle" class="small" fill="#15803d">inspect</text>
+
+  <path d="M 710 339 L 710 545 L 675 545 L 675 695 L 779 695 L 779 682" class="flow" stroke="#b45309" marker-end="url(#arrow-amber)"/>
+  <text x="722" y="363" class="small" fill="#b45309">immutable PENDING request</text>
+
+  <path d="M 280 645 L 305 645" class="flow" stroke="#b45309" marker-end="url(#arrow-amber)"/>
+  <path d="M 550 645 L 714 645" class="flow" stroke="#b45309" marker-end="url(#arrow-amber)"/>
+  <text x="632" y="635" text-anchor="middle" class="small" fill="#b45309">approve / reject</text>
+
+  <path d="M 820 682 L 820 742 L 590 742 L 590 478" class="flow" stroke="#2563eb" marker-end="url(#arrow-blue)"/>
+  <text x="705" y="738" text-anchor="middle" class="small" fill="#2563eb">status → resume stored action</text>
+
+  <path d="M 705 426 L 875 426 L 875 312 L 940 312" class="flow" stroke="#15803d" marker-end="url(#arrow-green)"/>
+  <text x="797" y="414" text-anchor="middle" class="small" fill="#15803d">single-use execution</text>
+
+  <path d="M 635 478 L 635 715 L 1067 715 L 1067 682" class="flow" stroke="#2563eb" marker-end="url(#arrow-blue)"/>
+  <text x="910" y="711" text-anchor="middle" class="small" fill="#2563eb">bounded lifecycle event</text>
+</svg>
