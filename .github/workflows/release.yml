@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate and publish tagged release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm exact tagged checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "$GITHUB_SHA"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Verify tag and project version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" != v?* ]]; then
+            echo "::error::Release tag must start with v and contain a version"
+            exit 1
+          fi
+
+          release_version="${GITHUB_REF_NAME#v}"
+          project_version="$(python - <<'PY'
+          import pathlib
+          import tomllib
+
+          with pathlib.Path("pyproject.toml").open("rb") as stream:
+              print(tomllib.load(stream)["project"]["version"])
+          PY
+          )"
+
+          if [[ "$project_version" != "$release_version" ]]; then
+            echo "::error::Tag version $release_version does not match pyproject version $project_version"
+            exit 1
+          fi
+
+          notes_path="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$notes_path" ]]; then
+            echo "::error::Release notes are missing: $notes_path"
+            exit 1
+          fi
+
+          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "RELEASE_NOTES=$notes_path" >> "$GITHUB_ENV"
+
+      - name: Validate lockfile
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --python "3.13"
+
+      - name: Verify installed project version
+        shell: bash
+        run: |
+          cli_version="$(uv run --no-sync mcp-toolhub --version)"
+          if [[ "$cli_version" != "$RELEASE_VERSION" ]]; then
+            echo "::error::mcp-toolhub reports $cli_version; expected $RELEASE_VERSION"
+            exit 1
+          fi
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Check formatting
+        run: uv run --no-sync ruff format --check .
+
+      - name: Compile package
+        run: uv run --no-sync python -m compileall -q src/mcp_toolhub
+
+      - name: Run full test suite
+        run: uv run --no-sync pytest -q
+
+      - name: Verify Contract V1 explicitly
+        run: uv run --no-sync pytest -q tests/test_contract.py
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Require one wheel and one source distribution
+        shell: bash
+        run: |
+          wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' -printf '.' | wc -c)"
+          sdist_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '.' | wc -c)"
+          if [[ "$wheel_count" -ne 1 || "$sdist_count" -ne 1 ]]; then
+            echo "::error::Expected exactly one wheel and one sdist; found $wheel_count wheel(s) and $sdist_count sdist(s)"
+            exit 1
+          fi
+
+      - name: Smoke-test the installed wheel
+        shell: bash
+        run: |
+          smoke_venv="$RUNNER_TEMP/mcp-toolhub-wheel-env"
+          uv run --no-sync python scripts/artifact_smoke.py \
+            --dist-dir dist \
+            --venv "$smoke_venv" \
+            --repository "$GITHUB_WORKSPACE"
+          installed_version="$("$smoke_venv/bin/mcp-toolhub" --version)"
+          if [[ "$installed_version" != "$RELEASE_VERSION" ]]; then
+            echo "::error::Installed wheel reports $installed_version; expected $RELEASE_VERSION"
+            exit 1
+          fi
+
+      - name: Validate artifact metadata
+        shell: bash
+        run: |
+          uv run --no-sync python - <<'PY'
+          import configparser
+          import email.policy
+          import os
+          import pathlib
+          import tarfile
+          import zipfile
+          from email.parser import BytesParser
+
+          dist = pathlib.Path("dist")
+          wheels = sorted(dist.glob("*.whl"))
+          sdists = sorted(dist.glob("*.tar.gz"))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          expected_version = os.environ["RELEASE_VERSION"]
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              metadata_paths = [
+                  name for name in names if name.endswith(".dist-info/METADATA")
+              ]
+              entry_point_paths = [
+                  name
+                  for name in names
+                  if name.endswith(".dist-info/entry_points.txt")
+              ]
+              license_paths = [
+                  name
+                  for name in names
+                  if name.endswith(".dist-info/licenses/LICENSE")
+              ]
+              assert len(metadata_paths) == 1, metadata_paths
+              assert len(entry_point_paths) == 1, entry_point_paths
+              assert len(license_paths) == 1, license_paths
+              metadata = BytesParser(policy=email.policy.default).parsebytes(
+                  archive.read(metadata_paths[0])
+              )
+              entry_points = configparser.ConfigParser()
+              entry_points.read_string(
+                  archive.read(entry_point_paths[0]).decode("utf-8")
+              )
+
+          assert metadata["Name"] == "mcp-toolhub", metadata["Name"]
+          assert metadata["Version"] == expected_version, metadata["Version"]
+          assert metadata["License-Expression"] == "MIT", metadata[
+              "License-Expression"
+          ]
+          expected_scripts = {
+              "mcp-toolhub": "mcp_toolhub.cli:main",
+              "mcp-toolhub-admin": "mcp_toolhub.admin:main",
+          }
+          assert dict(entry_points["console_scripts"]) == expected_scripts
+
+          with tarfile.open(sdists[0]) as archive:
+              members = [member for member in archive.getmembers() if member.isfile()]
+              names = [member.name for member in members]
+              pkg_info_members = [
+                  member for member in members if member.name.endswith("/PKG-INFO")
+              ]
+              assert len(pkg_info_members) == 1, names
+              assert any(name.endswith("/LICENSE") for name in names), names
+              stream = archive.extractfile(pkg_info_members[0])
+              assert stream is not None
+              sdist_metadata = BytesParser(
+                  policy=email.policy.default
+              ).parsebytes(stream.read())
+
+          assert sdist_metadata["Name"] == "mcp-toolhub", sdist_metadata["Name"]
+          assert sdist_metadata["Version"] == expected_version, sdist_metadata[
+              "Version"
+          ]
+          assert sdist_metadata["License-Expression"] == "MIT", sdist_metadata[
+              "License-Expression"
+          ]
+          PY
+
+      - name: Generate and verify SHA-256 checksums
+        shell: bash
+        run: |
+          cd dist
+          LC_ALL=C sha256sum -- *.whl *.tar.gz | LC_ALL=C sort -k 2 > SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq 2
+          sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $GITHUB_REF_NAME already exists; refusing to overwrite it"
+            exit 1
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.whl \
+            dist/*.tar.gz \
+            dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RELEASE_NOTES"
